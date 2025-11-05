@@ -1,0 +1,13 @@
+name = "SpatialRegression"
+uuid = "bc636db0-2636-4853-bb62-24dc471f1552"
+authors = ["Alfonso Landeros <alandero@ucr.edu> and contributors"]
+version = "1.0.0-DEV"
+
+[compat]
+julia = "1.12"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
