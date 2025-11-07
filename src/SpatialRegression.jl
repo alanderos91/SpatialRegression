@@ -4,6 +4,7 @@ using LinearAlgebra
 using StaticArrays
 using Distributions
 using ForwardDiff
+using DelaunayTriangulation
 
 import Distributions: loglikelihood
 
@@ -63,5 +64,48 @@ function cartesian(A::AbstractMatrix, V)
   end
   return out
 end
+
+struct TriangleObs
+  triangle::Tuple{Int,Int,Int} # indices in ascending order
+  y::Vector{Float64}  # response local to triangle
+  X::Matrix{Float64}  # covariates local to triangle
+  A::Matrix{Float64}  # mixture weights as barycentric coordinates
+  V::Matrix{Float64}  # vertices of triangle, stored in columns
+end
+
+function create_triobs_sets(y, X, S, tri)
+  stats = statistics(tri)
+  vertex = tri.points
+
+  # Matrix of vertices, stored along columns
+  V = Matrix{Float64}(undef, 2, stats.num_solid_vertices)
+  for j in each_solid_vertex(tri)
+    V[:, j] .= vertex[j]
+  end
+
+  # Retrieve each triangle, sorting indices in ascending order
+  dict = Dict{Tuple{Int,Int,Int},Vector{Int}}()
+  for (i, s) in enumerate(eachcol(S))
+    tri_ind = sort(find_triangle(tri, s))
+    if !haskey(dict, tri_ind)
+      dict[tri_ind] = Int[]
+    end
+    index_set = dict[tri_ind]
+    push!(index_set, i)
+  end
+
+  triobs = TriangleObs[]
+  k = 0
+  for (tri_ind, idx) in dict
+    k += 1
+    display(tri_ind)
+    Vₖ = V[:, [tri_ind...]]
+    A = barycentric(view(S, :, idx), Vₖ)
+    push!(triobs, TriangleObs(tri_ind, y[idx], X[idx, :], A, Vₖ))
+  end
+  return triobs
+end
+
+export TriangleObs, create_triobs_sets
 
 end
