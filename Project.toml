@@ -1,13 +1,19 @@
 name = "SpatialRegression"
 uuid = "bc636db0-2636-4853-bb62-24dc471f1552"
-authors = ["Alfonso Landeros <alandero@ucr.edu> and contributors"]
 version = "1.0.0-DEV"
+authors = ["Alfonso Landeros <alandero@ucr.edu> and contributors"]
 
 [deps]
+Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
+GLM = "38e38edf-8417-5370-95a0-9cbb8c7f171a"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 
 [compat]
+Distributions = "0.25.122"
+ForwardDiff = "1.2.2"
+GLM = "1.9.0"
 LinearAlgebra = "1.12"
 StaticArrays = "1.9"
 julia = "1.12"

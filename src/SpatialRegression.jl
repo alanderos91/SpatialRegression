@@ -2,6 +2,17 @@ module SpatialRegression
 
 using LinearAlgebra
 using StaticArrays
+using Distributions
+using ForwardDiff
+
+import Distributions: loglikelihood
+
+import GLM
+using GLM: GlmResp, Link, CauchitLink, CloglogLink,
+  IdentityLink, InverseLink, InverseSquareLink,
+  LogitLink, LogLink, NegativeBinomialLink,
+  PowerLink, ProbitLink, SqrtLink,
+  canonicallink
 
 #
 # COORDINATE CONVERSIONS
