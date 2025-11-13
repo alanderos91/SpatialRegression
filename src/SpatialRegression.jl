@@ -73,6 +73,9 @@ struct TriangleObs
   V::Matrix{Float64}  # vertices of triangle, stored in columns
 end
 
+# check if triangle has vertex with index j as one of its vertices
+has_vertex(T::TriangleObs, j::Int) = j in T.triangle
+
 function create_triobs_sets(y, X, S, tri)
   stats = statistics(tri)
   vertex = tri.points
@@ -106,6 +109,50 @@ function create_triobs_sets(y, X, S, tri)
   return triobs
 end
 
-export TriangleObs, create_triobs_sets
+struct VertexModel{D <: Distribution, L <: Link}
+  d::D                      # distribution
+  link::L                   # link function, g(μ) = η
+  v::Vector{Float64}        # vertex coordinates
+  index::Int                # vertex index, needed for consitency with triangulation
+  beta::Vector{Float64}     # coefficients, β
+  c::Vector{Float64}        # case weights, determined by GLM + mixture coefficients
+  gamma::Matrix{Float64}    # matrix of local average coefficients in MM algorithm, Γ
+  eta::Vector{Float64}      # linear predictor, η = xᵀβ
+  mu::Vector{Float64}       # mean parameter vector, μ = g⁻¹(η)
+  workres::Vector{Float64}  # working residuals, (y - μ) g'(μ)
+  w::Vector{Float64}        # penalty weights, w in ∑ w P(B)
+  rho::Float64              # penalty coefficient
+end
+
+function create_vertexmodel_set(d::D, link::L, tri::Triangulation, tobs::Vector{TriangleObs}, nvars; rho::Real = 1.0) where {D,L}
+  mv = VertexModel{D,L}[]
+  for j in each_solid_vertex(tri)
+    # count the total number of samples incident with vertex j
+    nsamples = 0
+    for k in eachindex(tobs)
+      if has_vertex(tobs[k], j)
+        nsamples += length(tobs[k].y)
+      end
+    end
+
+    # determine the number of incident vertices
+    nneighbors = length(DelaunayTriangulation.iterated_neighbourhood(tri, j, 1))
+
+    # allocate!
+    beta = zeros(nvars)
+    weights = zeros(nsamples)
+    gamma = zeros(nvars, nneighbors)
+    eta = zeros(nsamples)
+    mu = zeros(nsamples)
+    workres = zeros(nsamples)
+    w = zeros(nneighbors)
+
+    push!(mv, VertexModel(d, link, v, j, beta, weights, gamma, eta, mu, workres, w, rho))
+  end
+  return mv
+end
+
+export TriangleObs, create_triobs_sets,
+  VertexModel, create_vertexmodel_set
 
 end
