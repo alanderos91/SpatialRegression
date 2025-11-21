@@ -47,8 +47,15 @@ function simulate_data(n, Δ)
     v1, v2, v3 = Δ.points[[j,k,l]]
     b1, b2, b3 = @views begin B[:, j], B[:, k], B[:, l] end
     a1, a2, a3 = SpatialRegression.barycentric(s, [v1 v2 v3])
-    b = a1*b1 + a2*b2 + a3*b3
-    y[i] = @views dot(X[i,:], b) + 1/sqrt(n) * randn()
+    mixture = @views MixtureModel(
+      [
+        Normal(dot(X[i, :], b1), 1/sqrt(n)),
+        Normal(dot(X[i, :], b2), 1/sqrt(n)),
+        Normal(dot(X[i, :], b3), 1/sqrt(n)),
+      ],
+      [a1, a2, a3]
+    )
+    y[i] = rand(mixture)
   end
   return y, X, S, B
 end
