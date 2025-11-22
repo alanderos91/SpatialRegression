@@ -77,7 +77,7 @@ end
 
 Δ₀ = triangulate_convex(boundary_points, [1, 2, 3]; delete_ghosts = false)
 Δ₁ = equilateral_refinement(Δ₀, 0.01*init_area)
-Δ₂ = equilateral_refinement(Δ₁, 0.001*init_area)
+Δ₂ = equilateral_refinement(Δ₁, 0.0005*init_area)
 Δs = (Δ₀, Δ₁, Δ₂)
 
 figtri = Figure(size = (400*length(Δs), 400))
@@ -90,7 +90,7 @@ figtri
 #
 # SCENARIO 1: Uniform over domain
 #
-n, p = 10^4, 10
+n, p = 10^3, 10
 
 results1 = DataFrame(
   vertices = Int[],
