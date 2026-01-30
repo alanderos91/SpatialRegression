@@ -78,6 +78,13 @@ end
 # check if triangle has vertex with index j as one of its vertices
 has_vertex(T::TriangleObs, j::Int) = j in T.triangle
 
+function is_inside_mesh(Δ::Triangulation, s)
+  triangle = find_triangle(Δ, s, concavity_protection = true)
+ return all(>(0), triangle)
+end
+
+is_inside_mesh(Δ::Triangulation) = Base.Fix1(is_inside_mesh, Δ)
+
 function create_triobs_sets(y, X, S, tri)
   # Get points + mapping to solid vertices.
   # The mapping is needed to ensure vertex label = index into some array
@@ -94,7 +101,8 @@ function create_triobs_sets(y, X, S, tri)
   # Retrieve each triangle, sorting indices in ascending order
   dict = Dict{Tuple{Int,Int,Int},Vector{Int}}()
   for (i, s) in enumerate(eachcol(S))
-    j, k, l = find_triangle(tri, s)
+    j, k, l = find_triangle(tri, s, concavity_protection = true)
+    # @show i, s, j, k, l, is_inside_mesh(tri, s)
     tri_ind = sort((id2vertex[j], id2vertex[k], id2vertex[l]))
     if !haskey(dict, tri_ind)
       dict[tri_ind] = Int[]
@@ -195,7 +203,12 @@ end
 
 function stable_logsumexp(a, f)
   s, c = stable_explogsum(a, f)
-  return log(a[s]) + f[s] + log(c)
+  if isinf(c)
+    s = argmax(f)
+    return log(a[s]) + f[s] 
+  else
+    return log(a[s]) + f[s] + log(c)
+  end
 end
 
 function stable_explogsum(a, f)
@@ -205,6 +218,16 @@ function stable_explogsum(a, f)
     c += a[k] / a[s] * exp(f[k] - f[s])
   end
   return s, c
+end
+
+stable_glmvar(family::Distribution, μ, η) = GLM.glmvar(family, μ)
+function stable_glmvar(family::Binomial, μ, η)
+  if iszero(μ) || isone(μ)
+    expabs = exp(-abs(η))
+    return expabs / (1 + 2*expabs + expabs^2) 
+  else
+    return GLM.glmvar(family, μ)
+  end
 end
 
 function eval_loglikelihood(tobs, vmod)
@@ -276,7 +299,11 @@ function eval_surrogate(beta, index, gamma, weights, rho, vmod, tobs)
       as = (a1, a2, a3)
       fs = (f1, f2, f3)
       s, c = stable_explogsum(as, fs)
-      zweight = as[1] / as[s] * exp(fs[1] - fs[s]) / c
+      if isinf(c)
+        zweight = one(c)        
+      else
+        zweight = as[1] / as[s] * exp(fs[1] - fs[s]) / c
+      end
 
       η = dot(x, beta)
       μ, _, _ = GLM.inverselink(link, η)
@@ -376,78 +403,105 @@ function fitmodel(yfull, Xfull, Sfull, tri;
       
       fill!(∇L, 0); fill!(∇²L, 0)
       idx = 1
-      for triidx in v.triangles
-        T = tobs[triidx]
-        j, k, l = T.triangle
-        A, y, X = T.A, T.y, T.X
-        v1, v2, v3 = vmod[j], vmod[k], vmod[l]
-        
-        # Compute weights and working residuals
-        for i in eachindex(y)
-          # exp(f) may be close to 0; replace with A[]
-          a1, f1 = A[1, i], @views loglik_obs(v1, y[i], X[i, :])
-          a2, f2 = A[2, i], @views loglik_obs(v2, y[i], X[i, :])
-          a3, f3 = A[3, i], @views loglik_obs(v3, y[i], X[i, :])
-          as = (a1, a2, a3)
-          fs = (f1, f2, f3)
+      if isempty(v.triangles)
+        # Case: Incident observation sets are empty
+        mul!(v.beta_new, Γ, w)
+        sumw = sum(w)
+        @. v.beta_new = v.beta_new / sumw
+      else
+        # Case: Incident observation sets are not empty
+        for triidx in v.triangles
+          T = tobs[triidx]
+          j, k, l = T.triangle
+          A, y, X = T.A, T.y, T.X
+          v1, v2, v3 = vmod[j], vmod[k], vmod[l]
+          
+          # Compute weights and working residuals
+          for i in eachindex(y)
+            # exp(f) may be close to 0; replace with A[]
+            a1, f1 = A[1, i], @views loglik_obs(v1, y[i], X[i, :])
+            a2, f2 = A[2, i], @views loglik_obs(v2, y[i], X[i, :])
+            a3, f3 = A[3, i], @views loglik_obs(v3, y[i], X[i, :])
+            as = (a1, a2, a3)
+            fs = (f1, f2, f3)
 
-          t = findfirst(==(v.index), T.triangle)
-          s, c = stable_explogsum(as, fs)
-          zweight = as[t] / as[s] * exp(fs[t] - fs[s]) / c
+            t = findfirst(==(v.index), T.triangle)
+            s, c = stable_explogsum(as, fs)
+            if isinf(c)
+              zweight = one(c)
+            else
+              zweight = as[t] / as[s] * exp(fs[t] - fs[s]) / c
+            end
+            η[idx] = @views dot(X[i, :], β)
+            μ[idx], dμdη = GLM.inverselink(v.link, η[idx])
+            r[idx] = (y[i] - μ[idx]) / dμdη
+            d[idx] = zweight * dμdη^2 / stable_glmvar(v.family, μ[idx], η[idx])
+            if isnan(d[idx]) || isinf(d[idx]) || isnan(r[idx]) || isinf(r[idx])
+              display(as)
+              display(fs)
+              display(r[idx])
+              display(d[idx])
+              display(t)
+              display(s)
+              display(c)
+              display(η[idx])
+              display(μ[idx])
+              display(dμdη)
+              display(y[i])
+              display(zweight)
+              display(GLM.glmvar(v.family, μ[idx]))
+              error("NAN")
+            end
+            idx += 1
+          end
 
-          η[idx] = @views dot(X[i, :], β)
-          μ[idx], dμdη = GLM.inverselink(v.link, η[idx])
-          r[idx] = (y[i] - μ[idx]) / dμdη
-          d[idx] = zweight * dμdη^2 / GLM.glmvar(v.family, μ[idx])
-          idx += 1
+          # Evaluate gradient + Hessian
+          idxrange = (idx-length(y)):(idx-1)
+          Dj = Diagonal(view(d, idxrange))
+          rj = view(r, idxrange)
+          ∇L .+= X' * Dj * rj
+          ∇²L .+= X' * Dj * X
         end
+        # idxpen = (1+intercept):nvars
+        # ∇L[idxpen] .= ∇L[idxpen] - 2*v.rho*(sum(w)*β[idxpen] - Γ[idxpen,:]*w)
+        # ∇²L[idxpen,idxpen] .= ∇²L[idxpen,idxpen] + 2*v.rho*sum(w)*I
+        ∇L .= ∇L - 2*v.rho*(sum(w)*β - Γ*w)
+        ∇²L .= ∇²L + 2*v.rho*sum(w)*I
+        # ∇G = ForwardDiff.gradient(beta -> G(beta, v.index, Γ, w, v.rho, vmod, tobs), β)
+        # ∇²G = -ForwardDiff.hessian(beta -> G(beta, v.index, Γ, w, v.rho, vmod, tobs), β)
 
-        # Evaluate gradient + Hessian
-        idxrange = (idx-length(y)):(idx-1)
-        Dj = Diagonal(view(d, idxrange))
-        rj = view(r, idxrange)
-        ∇L .+= X' * Dj * rj
-        ∇²L .+= X' * Dj * X
-      end
-      # idxpen = (1+intercept):nvars
-      # ∇L[idxpen] .= ∇L[idxpen] - 2*v.rho*(sum(w)*β[idxpen] - Γ[idxpen,:]*w)
-      # ∇²L[idxpen,idxpen] .= ∇²L[idxpen,idxpen] + 2*v.rho*sum(w)*I
-      ∇L .= ∇L - 2*v.rho*(sum(w)*β - Γ*w)
-      ∇²L .= ∇²L + 2*v.rho*sum(w)*I
-      # ∇G = ForwardDiff.gradient(beta -> G(beta, v.index, Γ, w, v.rho, vmod, tobs), β)
-      # ∇²G = -ForwardDiff.hessian(beta -> G(beta, v.index, Γ, w, v.rho, vmod, tobs), β)
+        # @show findall(isnan, D.diag)
+        # @show v.index
+        # Compute the search direction
+        # display(eigvals(Symmetric(∇²L)))
+        search_direction .= Symmetric(∇²L) \ ∇L
+        # @show norm(∇L), norm(search_direction)
 
-      # @show findall(isnan, D.diag)
-      # @show v.index
-      # display(∇²L)
-      # Compute the search direction
-      search_direction .= Symmetric(∇²L) \ ∇L
-      # @show norm(∇L), norm(search_direction)
-
-      # Backtracking line search
-      t = 1.0
-      v.beta_new .= β
-      for step in 0:backtrack
-        # if iter == 1 break end
-        @. v.beta_new = β + t * search_direction
-        # @assert β === v.beta
-        # objective_new = eval_surrogate(v, vmod, tobs)
-        objective_new = eval_surrogate(v.beta_new, v.index, Γ, w, v.rho, vmod, tobs)
-        # @show objective_new, objective
-        if objective_new >= objective
-          break
-        elseif step < backtrack
-          t /= 2
-        else
-          @show t, objective_new, objective
-          error("Backtracking failed at iteration $(iter) for vertex $(v.index) after $(step) attempts!")
-          v.beta_new .= β
-          break
+        # Backtracking line search
+        t = 1.0
+        v.beta_new .= β
+        for step in 0:backtrack
+          # if iter == 1 break end
+          @. v.beta_new = β + t * search_direction
+          # @assert β === v.beta
+          # objective_new = eval_surrogate(v, vmod, tobs)
+          objective_new = eval_surrogate(v.beta_new, v.index, Γ, w, v.rho, vmod, tobs)
+          # @show objective_new, objective
+          if objective_new >= objective
+            break
+          elseif step < backtrack
+            t /= 2
+          else
+            @show t, objective_new, objective
+            error("Backtracking failed at iteration $(iter) for vertex $(v.index) after $(step) attempts!")
+            v.beta_new .= β
+            break
+          end
         end
+        # β .= v.beta_new
+        # @. v.beta_new = β + t * search_direction
+        # println("Success for vertex $(v.index)")
       end
-      # β .= v.beta_new
-      # @. v.beta_new = β + t * search_direction
-      # println("Success for vertex $(v.index)")
     end
 
     # Apply all updates
@@ -458,10 +512,14 @@ function fitmodel(yfull, Xfull, Sfull, tri;
     # Evaluate log-likelihood
     logl_prev = logl
     logl = eval_loglikelihood(tobs, vmod)
+    if logl < logl_prev
+      @warn "Detected increase in log-likelihood, likely due to instability in evaluating it at current estimate."
+      break
+    end
     # rel = abs(logl - logl_prev) / (1 + abs(logl_prev))
     # @show iter, logl, logl_prev, rel
   end
-  @show norm(∇L)
+  # @show norm(∇L)
   return iter, tobs, vmod
 end
 
@@ -472,15 +530,15 @@ function predict(X, S, vmod, tri)
   @views for i in axes(X, 1)
     s = S[:, i]
     x = X[i, :]
-    j, k, l = find_triangle(tri, s) |> sort
+    j, k, l = find_triangle(tri, s; concavity_protection = true) |> sort
     p, q, r = points[j], points[k], points[l]
     j, k, l = id2vertex[j], id2vertex[k], id2vertex[l]
     v, u, w = vmod[j], vmod[k], vmod[l]
-    a, b, c = barycentric(s, [p q r])
+    a, b, c = barycentric(s, [p[1] q[1] r[1]; p[2] q[2] r[2]])
     yhat[i] = 
-      GLM.linkinv(v.link, a*dot(x, v.beta)) +
-      GLM.linkinv(u.link, b*dot(x, u.beta)) +
-      GLM.linkinv(w.link, c*dot(x, w.beta))
+      a*GLM.linkinv(v.link, dot(x, v.beta)) +
+      b*GLM.linkinv(u.link, dot(x, u.beta)) +
+      c*GLM.linkinv(w.link, dot(x, w.beta))
   end
   return yhat
 end
