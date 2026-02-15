@@ -267,7 +267,7 @@ function eval_loglikelihood(tobs, vmod)
       @inbounds @simd for j in eachindex(v.beta)
         diff += abs2(v.beta[j] - u.beta[j])
       end
-      logl -= v.rho/4 * v.weights[idx] * diff
+      logl -= v.rho/2 * v.weights[idx] * diff
     end
   end
   return logl
@@ -350,8 +350,8 @@ function eval_surrogate(beta, j, gamma, weights, rho, vmod, tobs)
   penalty = zero(logl)
   for (idx, γ) in enumerate(eachcol(gamma))
     diff = zero(eltype(beta))
-    @inbounds @simd for j in eachindex(beta)
-      diff += abs2(beta[j] - γ[j])
+    @inbounds @simd for k in eachindex(beta)
+      diff += abs2(beta[k] - γ[k])
     end
     penalty -= rho * weights[idx] * diff
   end
@@ -526,8 +526,6 @@ function fitmodel(yfull, Xfull, Sfull, tri;
     # rel = abs(logl - logl_prev) / (1 + abs(logl_prev))
     # @show iter, logl, logl_prev, rel
   end
-  # @show norm(∇L)
-  # @show logl
   return iter, tobs, vmod
 end
 
