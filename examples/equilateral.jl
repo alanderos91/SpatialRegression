@@ -8,13 +8,6 @@ using CairoMakie
 using DataFrames, PrettyTables
 using SpatialRegression.GLM
 
-# Vertices of equilateral triangle centered at (0, 0), inscribed in unit circle
-# Create boundary points of triangle area; use CCW orientation
-boundary_points = [[0.0, 1.0], [-sqrt(3)/2, -1/2], [sqrt(3)/2, -1/2]]
-init_area = 0.5 *
-  norm(boundary_points[1] - 0.5*(boundary_points[2] + boundary_points[3])) *
-  norm(boundary_points[3] - boundary_points[2])
-
 function equilateral_refinement(Δ, max_area)
   Δnew = refine!(deepcopy(Δ),
     max_area = max_area,
@@ -45,7 +38,7 @@ function create_component(::Poisson, link, η)
   return Poisson(GLM.linkinv(link, η))
 end
 
-function simulate_data(n, p, Δ, family, link)
+function simulate_data(n, p, Δ, family, link; sigma = 1.0)
   # Sample from the standard 2-simplex, then convert to Cartesian coords
   A = rand(Dirichlet(ones(3)), n)
   V = [0 1; -sqrt(3)/2 -1/2; sqrt(3)/2 -1/2] |> Transpose |> Matrix{Float64}
@@ -75,7 +68,7 @@ function simulate_data(n, p, Δ, family, link)
       ],
       [a1, a2, a3]
     )
-    y[i] = rand(mixture)
+    y[i] = rand(mixture) + sigma*randn()
   end
   return y, X, S, B
 end
@@ -192,71 +185,91 @@ function run_benchmarks(scenario, seed)
   return results, instances
 end
 
-Random.seed!(1903)
-Δ₀ = triangulate_convex(boundary_points, [1, 2, 3]; delete_ghosts = false)
-Δ₁ = equilateral_refinement(Δ₀, 0.01*init_area)
-Δ₂ = equilateral_refinement(Δ₁, 0.001*init_area)
-Δs = (Δ₀, Δ₁, Δ₂);
-
-figtri = Figure(size = (400*length(Δs), 400));
-for (j, Δ) in enumerate(Δs)
-  ax = Axis(figtri[1,j], title = get_tri_title(Δ))
-  triplot!(ax, Δ)
-end
-figtri
-save("Figure-Meshes.pdf", figtri)
-
-# RUN BENCHMARKS
-n, p = 10^4, 10
-seed = 1903
-scenarios = [
-  #
-  # SCENARIO 1: Uniform over domain, Normal response
-  #
-  (;
-    name    = "Balanced_Normal",
-    data    = Δ -> simulate_data(n, p, Δ, Normal(0.0, 0.1), IdentityLink()),
-    family  = Normal(),
-    link    = IdentityLink(),
-    triangulations = Δs,
-  ),
-  #
-  # SCENARIO 2: Uniform over domain, Binomial response
-  #
-  (;
-    name    = "Balanced_Binomial",
-    data    = Δ -> simulate_data(n, p, Δ, Binomial(), LogitLink()),
-    family  = Binomial(),
-    link    = LogitLink(),
-    triangulations = Δs,
-  ),
-  #
-  # SCENARIO 3: Uniform over domain, Poisson response
-  #
-  (;
-    name    = "Balanced_Poisson",
-    data    = Δ -> simulate_data(n, p, Δ, Poisson(), LogLink()),
-    family  = Poisson(),
-    link    = LogLink(),
-    triangulations = Δs,
-  ),
-];
-
-fig = Figure[]
-tbl = DataFrame[]
-ins = []
-for scenario in scenarios
-  results, instances = run_benchmarks(scenario, seed)
-  figure = plot_compare_fitted(instances)
-  save("Figure-$(scenario.name).pdf", figure)
-  push!(tbl, results)
-  push!(fig, figure)
-  push!(ins, instances)
+function default_equilateral_domain()
+  # Vertices of equilateral triangle centered at (0, 0), inscribed in unit circle
+  # Create boundary points of triangle area; use CCW orientation
+  return [[0.0, 1.0], [-sqrt(3)/2, -1/2], [sqrt(3)/2, -1/2]]
 end
 
-foreach(display, fig)
-foreach(display, tbl)
-
-open("Table-Balanced.txt", "w") do io
-  pretty_table(io, vcat(tbl...); backend = :latex)
+function init_triangulation(boundary_points = default_equilateral_domain())
+  triangulate_convex(boundary_points, [1, 2, 3]; delete_ghosts = false)
 end
+
+function main()
+  boundary_points = default_equilateral_domain()
+  init_area = 0.5 *
+  norm(boundary_points[1] - 0.5*(boundary_points[2] + boundary_points[3])) *
+  norm(boundary_points[3] - boundary_points[2])
+
+  Random.seed!(1903)
+  Δ₀ = init_triangulation(boundary_points)
+  Δ₁ = equilateral_refinement(Δ₀, 0.01*init_area)
+  Δ₂ = equilateral_refinement(Δ₁, 0.001*init_area)
+  Δs = (Δ₀, Δ₁, Δ₂);
+
+  figtri = Figure(size = (400*length(Δs), 400));
+  for (j, Δ) in enumerate(Δs)
+    ax = Axis(figtri[1,j], title = get_tri_title(Δ))
+    triplot!(ax, Δ)
+  end
+  figtri
+  save("Figure-Meshes.pdf", figtri)
+
+  # RUN BENCHMARKS
+  n, p = 10^4, 10
+  seed = 1903
+  scenarios = [
+    #
+    # SCENARIO 1: Uniform over domain, Normal response
+    #
+    (;
+      name    = "Balanced_Normal",
+      data    = Δ -> simulate_data(n, p, Δ, Normal(0.0, 0.1), IdentityLink()),
+      family  = Normal(),
+      link    = IdentityLink(),
+      triangulations = Δs,
+    ),
+    #
+    # SCENARIO 2: Uniform over domain, Binomial response
+    #
+    (;
+      name    = "Balanced_Binomial",
+      data    = Δ -> simulate_data(n, p, Δ, Binomial(), LogitLink()),
+      family  = Binomial(),
+      link    = LogitLink(),
+      triangulations = Δs,
+    ),
+    #
+    # SCENARIO 3: Uniform over domain, Poisson response
+    #
+    (;
+      name    = "Balanced_Poisson",
+      data    = Δ -> simulate_data(n, p, Δ, Poisson(), LogLink()),
+      family  = Poisson(),
+      link    = LogLink(),
+      triangulations = Δs,
+    ),
+  ];
+
+  fig = Figure[]
+  tbl = DataFrame[]
+  ins = []
+  for scenario in scenarios
+    results, instances = run_benchmarks(scenario, seed)
+    figure = plot_compare_fitted(instances)
+    save("Figure-$(scenario.name).pdf", figure)
+    push!(tbl, results)
+    push!(fig, figure)
+    push!(ins, instances)
+  end
+
+  foreach(display, fig)
+  foreach(display, tbl)
+
+  open("Table-Balanced.txt", "w") do io
+    pretty_table(io, vcat(tbl...); backend = :latex)
+  end
+end
+
+main()
+
