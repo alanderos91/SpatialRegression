@@ -65,7 +65,6 @@ function cartesian(A::AbstractMatrix, V)
   return out
 end
 
-exp_clamp(logf) = clamp()
 struct TriangleObs
   triangle::Tuple{Int,Int,Int} # indices in ascending order
   idx::Vector{Int}    # set of indices into original data (y, X)
@@ -99,25 +98,24 @@ function create_triobs_sets(y, X, S, tri)
   end
 
   # Retrieve each triangle, sorting indices in ascending order
+  # TODO: This step is a bottleneck and slows create_triobs_sets() when the number of units is large.
   dict = Dict{Tuple{Int,Int,Int},Vector{Int}}()
   for (i, s) in enumerate(eachcol(S))
     j, k, l = find_triangle(tri, s, concavity_protection = true)
-    # @show i, s, j, k, l, is_inside_mesh(tri, s)
-    tri_ind = sort((id2vertex[j], id2vertex[k], id2vertex[l]))
-    if !haskey(dict, tri_ind)
-      dict[tri_ind] = Int[]
+    triidx = sort((id2vertex[j], id2vertex[k], id2vertex[l]))
+    if !haskey(dict, triidx)
+      dict[triidx] = Int[]
     end
-    index_set = dict[tri_ind]
-    push!(index_set, i)
+    push!(dict[triidx], i)
   end
 
   triobs = TriangleObs[]
   k = 0
-  for (tri_ind, idx) in dict
+  for (triidx, idx) in dict
     k += 1
-    Vₖ = V[:, [tri_ind...]]
+    Vₖ = V[:, [triidx[1], triidx[2], triidx[3]]]
     A = barycentric(view(S, :, idx), Vₖ)
-    push!(triobs, TriangleObs(tri_ind, idx, y[idx], X[idx, :], A, Vₖ))
+    push!(triobs, TriangleObs(triidx, idx, y[idx], X[idx, :], A, Vₖ))
   end
   return triobs
 end
@@ -195,9 +193,13 @@ function create_vertexmodel_set(family::D, link::L, tri::Triangulation, tobs::Ve
 end
 
 function loglik_obs(v::VertexModel, y, x)
-  η = dot(x, v.beta)
-  μ, _ = GLM.inverselink(v.link, η)
-  logl = GLM.loglik_obs(v.family, y, μ, 1, 1)
+  loglik_obs(v.beta, y, x, v.family, v.link)
+end
+
+function loglik_obs(beta, y, x, family, link)
+  η = dot(x, beta)
+  μ, _ = GLM.inverselink(link, η)
+  logl = GLM.loglik_obs(family, y, μ, 1, 1)
   return logl
 end
 
@@ -221,6 +223,7 @@ function stable_explogsum(a, f)
 end
 
 stable_glmvar(family::Distribution, μ, η) = GLM.glmvar(family, μ)
+
 function stable_glmvar(family::Binomial, μ, η)
   if iszero(μ) || isone(μ)
     expabs = exp(-abs(η))
@@ -230,30 +233,41 @@ function stable_glmvar(family::Binomial, μ, η)
   end
 end
 
+function eval_loglikelihoods(v, y, x)
+  return (  # TODO: Make this use BLAS; i.e. η₁, η₂, η₃ = Bᵀx with Bᵀ 3 × p
+    loglik_obs(v[1], y, x),
+    loglik_obs(v[2], y, x),
+    loglik_obs(v[3], y, x)
+  )
+end
+
 function eval_loglikelihood(tobs, vmod)
   logl = zero(Float64)
   # Log-Likelihood
   for T in tobs
-    j, k, l = T.triangle
     A, y, X = T.A, T.y, T.X
-    v1, v2, v3 = vmod[j], vmod[k], vmod[l]
-    @views for i in eachindex(y)
+    _, v = get_triangle_vertices(T, T.triangle[1], vmod)
+    for i in eachindex(y)
+      x = view(X, i, :)
+      a = view(A, :, i)
+
       # evaluate log-likelihood at each vertex
-      a1, f1 = A[1,i], loglik_obs(v1, y[i], X[i, :])
-      a2, f2 = A[2,i], loglik_obs(v2, y[i], X[i, :])
-      a3, f3 = A[3,i], loglik_obs(v3, y[i], X[i, :])
+      logf = eval_loglikelihoods(v, y[i], x)
       
       # shift log(∑ⱼ αⱼ exp(fⱼ)) by the most negative log-likelihood
-      f = (f1, f2, f3)
-      a = (a1, a2, a3)
-      logl += stable_logsumexp(a, f)
+      logl += stable_logsumexp(a, logf)
     end
   end
+
   # Penalty
   for v in vmod
     for (idx, k) in enumerate(v.neighbors)
       u = vmod[k]
-      logl -= v.rho/4 * v.weights[idx] * sum(abs2, v.beta - u.beta)
+      diff = zero(eltype(v.beta))
+      @inbounds @simd for j in eachindex(v.beta)
+        diff += abs2(v.beta[j] - u.beta[j])
+      end
+      logl -= v.rho/4 * v.weights[idx] * diff
     end
   end
   return logl
@@ -264,59 +278,84 @@ function eval_surrogate(tobs, vmod, j)
   eval_surrogate(v.beta, v.index, v.gamma, v.weights, v.rho, vmod, tobs)
 end
 
-function eval_surrogate(beta, index, gamma, weights, rho, vmod, tobs)
-  logl, v = zero(Float64), vmod[index]
+"""
+    get_triangle_vertices(T::TriangleObs, index, vmod)
+
+Match `index` to one of `(j, k, l)` and retrieve the vertices `(vⱼ, vₖ, vₗ)`.
+
+Returns `pos` as one of `1`, `2`, or `3` along with a tuple of vertices.
+"""
+function get_triangle_vertices(T::TriangleObs, index, vmod)
+  j, k, l = T.triangle
+  if index == j
+    pos = 1
+  elseif index == k
+    pos = 2
+  elseif index == l
+    pos = 3
+  else
+    error("The index $(index) is not in the triangle $(T.triangle).")
+  end
+  return pos, (vmod[j], vmod[k], vmod[l])
+end
+
+"""
+    stable_eval_mm_weight(t, a, v, y, x)
+
+Evaluate the MM weight in a log-likelihood surrogate, `a[t]*f[t] / (a[1]*f[1]+a[2]*f[2]+a[3]*f[3])`, using the exp-log-sum trick.
+Here `a` and `v` are vectors of length 3 containing convex weights and `VertexModel` objects, respectively.
+The index `t` indicates which vertex of `(v[1], v[2], v[3])` is the argument of the surrogate.
+
+Returns the MM weight.
+"""
+function stable_eval_mm_weight(t::Integer, a::AbstractVector{T}, logf::NTuple{3,T}) where T <: Real
+  s, c = stable_explogsum(a, logf)
+  if isinf(c)
+    zweight = one(c)        
+  else
+    zweight = a[t] / a[s] * exp(logf[t] - logf[s]) / c
+  end
+  return zweight
+end
+
+function stable_eval_mm_weight(t::Integer, a, v::NTuple{3,T}, y, x) where T <: VertexModel
+  logf = eval_loglikelihoods(v, y, x)
+  return stable_eval_mm_weight(t, a, logf)
+end
+
+function eval_surrogate(beta, j, gamma, weights, rho, vmod, tobs)
+  logl, vⱼ = zero(Float64), vmod[j]
+
   # Log-Likelihood
-  for triidx in v.triangles
+  for triidx in vⱼ.triangles
     T = tobs[triidx]
-    # j, k, l = T.triangle
-    pos1 = findfirst(==(index), T.triangle)
-    if pos1 == 1
-      j, k, l = T.triangle
-      pos2, pos3 = 2, 3
-    elseif pos1 == 2
-      k, j, l = T.triangle
-      pos2, pos3 = 1, 3
-    else # pos1 == 3
-      k, l, j = T.triangle
-      pos2, pos3 = 1, 2
-    end
-    v1, v2, v3 = vmod[j], vmod[k], vmod[l]
-    family, link = v1.family, v1.link
-    beta1, beta2, beta3 = v1.beta, v2.beta, v3.beta
     A, y, X = T.A, T.y, T.X
-    @views for i in eachindex(T.y)
-      x = X[i,:]
-      η1, η2, η3 = dot(x, beta1), dot(x, beta2), dot(x, beta3)
-      
-      μ1, _, _ = GLM.inverselink(link, η1)  
-      μ2, _, _ = GLM.inverselink(link, η2)
-      μ3, _, _ = GLM.inverselink(link, η3)
-      
-      a1, f1 = A[pos1, i], GLM.loglik_obs(family, y[i], μ1, 1, 1)
-      a2, f2 = A[pos2, i], GLM.loglik_obs(family, y[i], μ2, 1, 1)
-      a3, f3 = A[pos3, i], GLM.loglik_obs(family, y[i], μ3, 1, 1)
-      as = (a1, a2, a3)
-      fs = (f1, f2, f3)
-      s, c = stable_explogsum(as, fs)
-      if isinf(c)
-        zweight = one(c)        
-      else
-        zweight = as[1] / as[s] * exp(fs[1] - fs[s]) / c
-      end
+    t, v = get_triangle_vertices(T, j, vmod)
+    
+    for i in eachindex(T.y)
+      x = view(X, i, :)
+      a = view(A, :, i)
 
-      η = dot(x, beta)
-      μ, _, _ = GLM.inverselink(link, η)
-      f = GLM.loglik_obs(family, y[i], μ, 1, 1)
+      # Evaluate log-likelihood term at β
+      logfⱼ = loglik_obs(beta, y[i], x, vⱼ.family, vⱼ.link)
 
-      logl += zweight * f + zweight * (log(a1) + log(inv(zweight)))
+      # Evaluate terms dependent on the anchor point βₙ
+      zweight = stable_eval_mm_weight(t, a, v, y[i], x)
+
+      logl += zweight * logfⱼ + zweight * (log(a[t]) + log(inv(zweight)))
     end
   end
+
   # Penalty
   penalty = zero(logl)
   for (idx, γ) in enumerate(eachcol(gamma))
-    penalty -= rho * weights[idx] * sum(abs2, beta - γ)
+    diff = zero(eltype(beta))
+    @inbounds @simd for j in eachindex(beta)
+      diff += abs2(beta[j] - γ[j])
+    end
+    penalty -= rho * weights[idx] * diff
   end
+
   return logl + penalty
 end
 
@@ -363,10 +402,10 @@ end
 function fitmodel(yfull, Xfull, Sfull, tri;
     maxiter::Int = 100,
     backtrack::Int = 5,
-    tol = 1e-3,
-    family = Normal(),
-    link = GLM.canonicallink(family),
-    rho = 1.0,
+    tol::Real = 1e-3,
+    family::UnivariateDistribution = Normal(),
+    link::Link = GLM.canonicallink(family),
+    rho::Real = 1.0,
     # intercept = all(isequal(1), view(Xfull, :, 1)),
   )
   # Initialize
@@ -388,125 +427,93 @@ function fitmodel(yfull, Xfull, Sfull, tri;
     eval_gamma!(vmod)
 
     # Visit each vertex once to update local parameters
-    for v in vmod
+    for vⱼ in vmod
       # Setup local variables to match notation
-      β = v.beta
-      Γ = v.gamma
-      d = v.d
-      r = v.workres
-      η = v.eta
-      μ = v.mu
-      w = v.weights
+      β = vⱼ.beta
+      Γ = vⱼ.gamma
+      d = vⱼ.d
+      r = vⱼ.workres
+      η = vⱼ.eta
+      μ = vⱼ.mu
+      w = vⱼ.weights
 
-      objective = eval_surrogate(v.beta, v.index, Γ, w, v.rho, vmod, tobs)
-      isinf(objective) && display(v.beta)
+      objective = eval_surrogate(vⱼ.beta, vⱼ.index, Γ, w, vⱼ.rho, vmod, tobs)
+      isinf(objective) && display(vⱼ.beta)
       
-      fill!(∇L, 0); fill!(∇²L, 0)
-      idx = 1
-      if isempty(v.triangles)
+      idx = 1; fill!(∇L, 0); fill!(∇²L, 0)
+      if isempty(vⱼ.triangles)
         # Case: Incident observation sets are empty
-        mul!(v.beta_new, Γ, w)
+        mul!(vⱼ.beta_new, Γ, w)
         sumw = sum(w)
-        @. v.beta_new = v.beta_new / sumw
+        @. vⱼ.beta_new = vⱼ.beta_new / sumw
       else
         # Case: Incident observation sets are not empty
-        for triidx in v.triangles
+        for triidx in vⱼ.triangles
           T = tobs[triidx]
-          j, k, l = T.triangle
           A, y, X = T.A, T.y, T.X
-          v1, v2, v3 = vmod[j], vmod[k], vmod[l]
-          
+          t, v = get_triangle_vertices(T, vⱼ.index, vmod)
+
           # Compute weights and working residuals
           for i in eachindex(y)
-            # exp(f) may be close to 0; replace with A[]
-            a1, f1 = A[1, i], @views loglik_obs(v1, y[i], X[i, :])
-            a2, f2 = A[2, i], @views loglik_obs(v2, y[i], X[i, :])
-            a3, f3 = A[3, i], @views loglik_obs(v3, y[i], X[i, :])
-            as = (a1, a2, a3)
-            fs = (f1, f2, f3)
+            x = view(X, i, :)
+            a = view(A, :, i)
 
-            t = findfirst(==(v.index), T.triangle)
-            s, c = stable_explogsum(as, fs)
-            if isinf(c)
-              zweight = one(c)
-            else
-              zweight = as[t] / as[s] * exp(fs[t] - fs[s]) / c
-            end
-            η[idx] = @views dot(X[i, :], β)
-            μ[idx], dμdη = GLM.inverselink(v.link, η[idx])
+            zweight = stable_eval_mm_weight(t, a, v, y[i], x)
+            η[idx] = dot(x, β)
+            μ[idx], dμdη = GLM.inverselink(vⱼ.link, η[idx])
             r[idx] = (y[i] - μ[idx]) / dμdη
-            d[idx] = zweight * dμdη^2 / stable_glmvar(v.family, μ[idx], η[idx])
-            if isnan(d[idx]) || isinf(d[idx]) || isnan(r[idx]) || isinf(r[idx])
-              display(as)
-              display(fs)
-              display(r[idx])
-              display(d[idx])
-              display(t)
-              display(s)
-              display(c)
-              display(η[idx])
-              display(μ[idx])
-              display(dμdη)
-              display(y[i])
-              display(zweight)
-              display(GLM.glmvar(v.family, μ[idx]))
-              error("NAN")
-            end
+            d[idx] = zweight * dμdη^2 / stable_glmvar(vⱼ.family, μ[idx], η[idx])
+            # if isnan(d[idx]) || isinf(d[idx]) || isnan(r[idx]) || isinf(r[idx])
+            #   error("Encountered underflow/overflow. Check arrays!")
+            # end
             idx += 1
           end
 
           # Evaluate gradient + Hessian
           idxrange = (idx-length(y)):(idx-1)
-          Dj = Diagonal(view(d, idxrange))
-          rj = view(r, idxrange)
-          ∇L .+= X' * Dj * rj
-          ∇²L .+= X' * Dj * X
+          dd = view(d, idxrange)
+          rr = view(r, idxrange)
+          @inbounds for k in axes(X, 1)
+            xx = view(X, k, :)
+            BLAS.axpy!(dd[k] * rr[k], xx, ∇L)
+            BLAS.syr!('U', dd[k], xx, ∇²L)
+          end
         end
-        # idxpen = (1+intercept):nvars
-        # ∇L[idxpen] .= ∇L[idxpen] - 2*v.rho*(sum(w)*β[idxpen] - Γ[idxpen,:]*w)
-        # ∇²L[idxpen,idxpen] .= ∇²L[idxpen,idxpen] + 2*v.rho*sum(w)*I
-        ∇L .= ∇L - 2*v.rho*(sum(w)*β - Γ*w)
-        ∇²L .= ∇²L + 2*v.rho*sum(w)*I
-        # ∇G = ForwardDiff.gradient(beta -> G(beta, v.index, Γ, w, v.rho, vmod, tobs), β)
-        # ∇²G = -ForwardDiff.hessian(beta -> G(beta, v.index, Γ, w, v.rho, vmod, tobs), β)
 
-        # @show findall(isnan, D.diag)
-        # @show v.index
-        # Compute the search direction
-        # display(eigvals(Symmetric(∇²L)))
-        search_direction .= Symmetric(∇²L) \ ∇L
-        # @show norm(∇L), norm(search_direction)
+        wsum = sum(w)
+        wrho = 2 * vⱼ.rho
+        BLAS.gemm!('N', 'N', wrho, Γ, w, true, ∇L)
+        BLAS.axpy!(-wrho*wsum, β, ∇L)
+        # ∇L .= ∇L - wrho*(sum(w)*β - Γ*w)
+        @inbounds @simd for k in axes(∇²L, 2)
+          ∇²L[k,k] += wrho*wsum
+        end
+        # ∇²L .= ∇²L + wrho*wsum*I
+        ldiv!(search_direction, cholesky!(Symmetric(∇²L, :U)), ∇L)
 
         # Backtracking line search
         t = 1.0
-        v.beta_new .= β
+        vⱼ.beta_new .= β
         for step in 0:backtrack
-          # if iter == 1 break end
-          @. v.beta_new = β + t * search_direction
-          # @assert β === v.beta
-          # objective_new = eval_surrogate(v, vmod, tobs)
-          objective_new = eval_surrogate(v.beta_new, v.index, Γ, w, v.rho, vmod, tobs)
-          # @show objective_new, objective
+          @. vⱼ.beta_new = β + t * search_direction
+          objective_new = eval_surrogate(vⱼ.beta_new, vⱼ.index, Γ, w, vⱼ.rho, vmod, tobs)
           if objective_new >= objective
             break
           elseif step < backtrack
             t /= 2
           else
             @show t, objective_new, objective
-            error("Backtracking failed at iteration $(iter) for vertex $(v.index) after $(step) attempts!")
-            v.beta_new .= β
+            error("Backtracking failed at iteration $(iter) for vertex $(vⱼ.index) after $(step) attempts!")
+            @. vⱼ.beta_new = β
             break
           end
         end
-        # β .= v.beta_new
-        # @. v.beta_new = β + t * search_direction
-        # println("Success for vertex $(v.index)")
       end
     end
 
     # Apply all updates
-    for v in vmod
-      @. v.beta = v.beta_new
+    for vⱼ in vmod
+      @. vⱼ.beta = vⱼ.beta_new
     end
 
     # Evaluate log-likelihood
@@ -520,6 +527,7 @@ function fitmodel(yfull, Xfull, Sfull, tri;
     # @show iter, logl, logl_prev, rel
   end
   # @show norm(∇L)
+  # @show logl
   return iter, tobs, vmod
 end
 
