@@ -241,9 +241,13 @@ function eval_loglikelihoods(v, y, x)
   )
 end
 
-function eval_loglikelihood(tobs, vmod)
+abstract type AbstractPenalty end
+
+struct L2Squared <: AbstractPenalty end
+struct L1Approx <: AbstractPenalty epsilon::Float64 end
+
+function eval_loglikelihood(tobs, vmod, penalty_type::AbstractPenalty)
   logl = zero(Float64)
-  # Log-Likelihood
   for T in tobs
     A, y, X = T.A, T.y, T.X
     _, v = get_triangle_vertices(T, T.triangle[1], vmod)
@@ -259,7 +263,13 @@ function eval_loglikelihood(tobs, vmod)
     end
   end
 
-  # Penalty
+  penalty = eval_penalty(penalty_type, vmod)
+
+  return logl + penalty
+end
+
+function eval_penalty(::L2Squared, vmod)
+  penalty = zero(Float64)
   for v in vmod
     for (idx, k) in enumerate(v.neighbors)
       u = vmod[k]
@@ -267,15 +277,30 @@ function eval_loglikelihood(tobs, vmod)
       @inbounds @simd for j in eachindex(v.beta)
         diff += abs2(v.beta[j] - u.beta[j])
       end
-      logl -= v.rho/2 * v.weights[idx] * diff
+      penalty -= v.rho/4 * v.weights[idx] * diff
     end
   end
-  return logl
+  return penalty
 end
 
-function eval_surrogate(tobs, vmod, j)
-  v = vmod[j]
-  eval_surrogate(v.beta, v.index, v.gamma, v.weights, v.rho, vmod, tobs)
+function l1apx(x, ϵ)
+  return sqrt(x*x + ϵ*ϵ)
+end
+
+function eval_penalty(p::L1Approx, vmod)
+  epsilon = p.epsilon
+  penalty = zero(Float64)
+  for v in vmod
+    for (idx, k) in enumerate(v.neighbors)
+      u = vmod[k]
+      diff = zero(eltype(v.beta))
+      @inbounds @simd for j in eachindex(v.beta)
+        diff += l1apx(v.beta[j] - u.beta[j], epsilon)
+      end
+      penalty -= v.rho/2 * v.weights[idx] * diff
+    end
+  end
+  return penalty
 end
 
 """
@@ -323,7 +348,12 @@ function stable_eval_mm_weight(t::Integer, a, v::NTuple{3,T}, y, x) where T <: V
   return stable_eval_mm_weight(t, a, logf)
 end
 
-function eval_surrogate(beta, j, gamma, weights, rho, vmod, tobs)
+function eval_surrogate(tobs, vmod, j, penalty_type::AbstractPenalty)
+  v = vmod[j]
+  eval_surrogate(v.beta, v.index, v.gamma, v.weights, v.rho, vmod, tobs, penalty_type)
+end
+
+function eval_surrogate(beta, j, gamma, weights, rho, vmod, tobs, penalty_type::AbstractPenalty)
   logl, vⱼ = zero(Float64), vmod[j]
 
   # Log-Likelihood
@@ -347,7 +377,13 @@ function eval_surrogate(beta, j, gamma, weights, rho, vmod, tobs)
   end
 
   # Penalty
-  penalty = zero(logl)
+  penalty = eval_penalty_surrogate(penalty_type, rho, beta, weights, gamma, vⱼ.beta)
+
+  return logl + penalty
+end
+
+function eval_penalty_surrogate(::L2Squared, rho, beta, weights, gamma, betan)
+  penalty = zero(Float64)
   for (idx, γ) in enumerate(eachcol(gamma))
     diff = zero(eltype(beta))
     @inbounds @simd for k in eachindex(beta)
@@ -355,8 +391,72 @@ function eval_surrogate(beta, j, gamma, weights, rho, vmod, tobs)
     end
     penalty -= rho * weights[idx] * diff
   end
+  return penalty
+end
 
-  return logl + penalty
+function eval_penalty_surrogate(p::L1Approx, rho, beta, weights, gamma, betan)
+  epsilon = p.epsilon
+  penalty = zero(Float64)
+  for (idx, γ) in enumerate(eachcol(gamma))
+    diff = zero(eltype(beta))
+    @inbounds @simd for k in eachindex(beta)
+      eta = betan[k] - γ[k]
+      q = l1apx(eta, epsilon/2)
+      diff += 1 / (2*q) * ((beta[k] - γ[k])^2 - eta^2) + q
+    end
+    penalty -= rho * weights[idx] * diff
+  end
+  return penalty
+end
+
+function accumulate_penalty_derivs!(::L2Squared, grad, hess, rho, beta, weights, gamma)
+  wsum = sum(weights)
+  wrho = 2 * rho
+  BLAS.gemm!('N', 'N', wrho, gamma, weights, true, grad)
+  BLAS.axpy!(-wrho*wsum, beta, grad)
+  # grad .= grad - wrho*(sum(w)*beta - gamma*weights)
+  @inbounds @simd for k in axes(hess, 2)
+    hess[k,k] += wrho*wsum
+  end
+  # hess .= hess + wrho*wsum*I
+end
+
+function accumulate_penalty_derivs!(p::L1Approx, grad, hess, rho, beta, weights, gamma)
+  epsilon = p.epsilon
+  for k in eachindex(beta)
+    c, d = zero(Float64), zero(Float64)
+    for (idx, γ) in enumerate(eachcol(gamma))
+      eta = beta[k] - γ[k]
+      q = l1apx(eta, epsilon/2)
+      c += weights[idx] / q
+      d += eta * weights[idx] / q
+    end
+    grad[k] -= rho*d
+    hess[k,k] += rho*c
+  end
+end
+
+function update_empty_case!(::L2Squared, v, weights, gamma)
+  mul!(v.beta_new, gamma, weights)
+  sumw = sum(weights)
+  @. v.beta_new = v.beta_new / sumw
+  return nothing
+end
+
+function update_empty_case!(p::L1Approx, v, weights, gamma)
+  epsilon = p.epsilon
+  beta = v.beta
+  for k in eachindex(beta)
+    num, den = zero(Float64), zero(Float64)
+    for (idx, γ) in enumerate(eachcol(gamma))
+      eta = beta[k] - γ[k]
+      q = l1apx(eta, epsilon/2)
+      num += γ[k] * weights[idx] / q
+      den += weights[idx] / q
+    end
+    v.beta_new[k] = num / den
+  end
+  return nothing
 end
 
 function eval_gamma!(vmod)
@@ -406,14 +506,15 @@ function fitmodel(yfull, Xfull, Sfull, tri;
     family::UnivariateDistribution = Normal(),
     link::Link = GLM.canonicallink(family),
     rho::Real = 1.0,
+    penalty::PT = L2Squared(),
     # intercept = all(isequal(1), view(Xfull, :, 1)),
-  )
+  ) where PT <: AbstractPenalty
   # Initialize
   nvars = size(Xfull, 2)
   tobs = create_triobs_sets(yfull, Xfull, Sfull, tri)
   vmod = create_vertexmodel_set(family, link, tri, tobs, nvars; rho = rho)
   # initialize_coefficients!(tobs, vmod)
-  logl = eval_loglikelihood(tobs, vmod)
+  logl = eval_loglikelihood(tobs, vmod, penalty)
   logl_prev = zero(logl)
   ∇L = zeros(nvars)
   ∇²L = zeros(nvars, nvars)
@@ -437,15 +538,13 @@ function fitmodel(yfull, Xfull, Sfull, tri;
       μ = vⱼ.mu
       w = vⱼ.weights
 
-      objective = eval_surrogate(vⱼ.beta, vⱼ.index, Γ, w, vⱼ.rho, vmod, tobs)
+      objective = eval_surrogate(vⱼ.beta, vⱼ.index, Γ, w, vⱼ.rho, vmod, tobs, penalty)
       isinf(objective) && display(vⱼ.beta)
       
       idx = 1; fill!(∇L, 0); fill!(∇²L, 0)
       if isempty(vⱼ.triangles)
         # Case: Incident observation sets are empty
-        mul!(vⱼ.beta_new, Γ, w)
-        sumw = sum(w)
-        @. vⱼ.beta_new = vⱼ.beta_new / sumw
+        update_empty_case!(penalty, vⱼ, w, Γ)
       else
         # Case: Incident observation sets are not empty
         for triidx in vⱼ.triangles
@@ -480,23 +579,21 @@ function fitmodel(yfull, Xfull, Sfull, tri;
           end
         end
 
-        wsum = sum(w)
-        wrho = 2 * vⱼ.rho
-        BLAS.gemm!('N', 'N', wrho, Γ, w, true, ∇L)
-        BLAS.axpy!(-wrho*wsum, β, ∇L)
-        # ∇L .= ∇L - wrho*(sum(w)*β - Γ*w)
-        @inbounds @simd for k in axes(∇²L, 2)
-          ∇²L[k,k] += wrho*wsum
-        end
-        # ∇²L .= ∇²L + wrho*wsum*I
+        accumulate_penalty_derivs!(penalty, ∇L, ∇²L, rho, β, w, Γ)
+        # gg = ForwardDiff.gradient(b -> eval_surrogate(b, vⱼ.index, Γ, w, rho, vmod, tobs, penalty), β)
+        # hh = ForwardDiff.hessian(b -> -eval_surrogate(b, vⱼ.index, Γ, w, rho, vmod, tobs, penalty), β)
+        # @show norm(gg - ∇L)
+        # @show norm(Symmetric(hh, :U) - Symmetric(∇²L, :U))
         ldiv!(search_direction, cholesky!(Symmetric(∇²L, :U)), ∇L)
+        # ldiv!(search_direction, cholesky!(Symmetric(hh, :U)), ∇L)
+        # @. vⱼ.beta_new = β + search_direction
 
         # Backtracking line search
         t = 1.0
         vⱼ.beta_new .= β
         for step in 0:backtrack
           @. vⱼ.beta_new = β + t * search_direction
-          objective_new = eval_surrogate(vⱼ.beta_new, vⱼ.index, Γ, w, vⱼ.rho, vmod, tobs)
+          objective_new = eval_surrogate(vⱼ.beta_new, vⱼ.index, Γ, w, vⱼ.rho, vmod, tobs, penalty)
           if objective_new >= objective
             break
           elseif step < backtrack
@@ -518,11 +615,13 @@ function fitmodel(yfull, Xfull, Sfull, tri;
 
     # Evaluate log-likelihood
     logl_prev = logl
-    logl = eval_loglikelihood(tobs, vmod)
-    if logl < logl_prev
-      @warn "Detected increase in log-likelihood, likely due to instability in evaluating it at current estimate."
-      break
-    end
+    logl = eval_loglikelihood(tobs, vmod, penalty)
+    # if logl < logl_prev
+    #   rel = abs(logl - logl_prev) / (1 + abs(logl_prev))
+    #   @show iter, logl, logl_prev, rel
+    #   @warn "Detected increase in log-likelihood, likely due to instability in evaluating it at current estimate."
+    #   break
+    # end
     # rel = abs(logl - logl_prev) / (1 + abs(logl_prev))
     # @show iter, logl, logl_prev, rel
   end
