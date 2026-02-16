@@ -15,15 +15,6 @@ function equilateral_refinement(Δ, max_area)
   return Δnew
 end
 
-function btest(n, p, Δ)
-  A = rand(Dirichlet(ones(3)), n)
-  V = [0 1; -sqrt(3)/2 -1/2; sqrt(3)/2 -1/2] |> Transpose |> Matrix{Float64}
-  S = SpatialRegression.cartesian(A, V)
-  Bfun(x, y, k, n) = sin(4*(x+k/n*pi/8)) + cos(6*y)
-  points = [[get_point(Δ, v)...] for v in each_solid_vertex(Δ)]
-  B = [log10(j+1)*Bfun(s[1], s[2], j, p) for j in 1:p, s in points]
-end
-
 function create_component(family::Normal, link, η)
   σ = scale(family)
   μ = GLM.linkinv(link, η)
@@ -38,26 +29,32 @@ function create_component(::Poisson, link, η)
   return Poisson(GLM.linkinv(link, η))
 end
 
-function simulate_data(n, p, Δ, family, link; sigma = 1.0)
+function simulate_data(n, p, Δ, family, link)
   # Sample from the standard 2-simplex, then convert to Cartesian coords
   A = rand(Dirichlet(ones(3)), n)
   V = [0 1; -sqrt(3)/2 -1/2; sqrt(3)/2 -1/2] |> Transpose |> Matrix{Float64}
   S = SpatialRegression.cartesian(A, V)
 
   # Simulate responses at each location according to true model
-  Bfun(x, y, k, n) = sin(4*(x+k/n*pi/8)) + cos(6*y)
-  points = [[get_point(Δ, v)...] for v in each_solid_vertex(Δ)]
+  Bfun(x, y, k, n) = (1 - (1 - 2*(x+1/2*cos(pi*k/n)))^2) * (1 - (1 - 2*(y+1/2 + 1/2*sin(pi*k/n)))^2)
+  vertices = [[get_point(Δ, v)...] for v in each_solid_vertex(Δ)]
+  points = get_points(Δ)
   id2vertex = Dict{Int,Int}(id => j for (j, id) in enumerate(each_solid_vertex(Δ)))
   X = 1/p*rand(n, p)
   X[:, 1] .= 1
-  B = [Bfun(s[1], s[2], j, p) for j in 1:p, s in points]
-  B[1, :] .= 4.0
+  B = [Bfun(s[1], s[2], j-1, p) for j in 1:p, s in vertices]
+  if family isa Poisson
+    B[1, :] .= rand(Uniform(3, 6), size(B, 2))
+    B[2:end, :] .*= 1/4
+  else
+    B[1, :] .= rand(Uniform(-3, 3), size(B, 2))
+  end
   y = zeros(n)
   for i in 1:n
     s = @views S[:, i]
     j, k, l = find_triangle(Δ, s; concavity_protection = true) |> sort
-    j, k, l = id2vertex[j], id2vertex[k], id2vertex[l]
     v1, v2, v3 = points[[j,k,l]]
+    j, k, l = id2vertex[j], id2vertex[k], id2vertex[l]
     b1, b2, b3 = @views begin B[:, j], B[:, k], B[:, l] end
     a1, a2, a3 = SpatialRegression.barycentric(s, [v1 v2 v3])
     mixture = @views MixtureModel(
@@ -68,7 +65,7 @@ function simulate_data(n, p, Δ, family, link; sigma = 1.0)
       ],
       [a1, a2, a3]
     )
-    y[i] = rand(mixture) + sigma*randn()
+    y[i] = rand(mixture)
   end
   return y, X, S, B
 end
@@ -131,7 +128,7 @@ function init_table()
   )
 end
 
-function run_benchmark!(generate_data, results, Δ, family, link, seed)
+function run_benchmark!(generate_data, results, Δ, family, link, seed, rho)
   # Sample from data generating function
   Random.seed!(seed)
   local y, X, S, B0 = generate_data(Δ)
@@ -140,7 +137,7 @@ function run_benchmark!(generate_data, results, Δ, family, link, seed)
   timed_result = @timed SpatialRegression.fitmodel(y, X, S, Δ;
     family = family,
     link = link,
-    rho = 1.0,
+    rho = rho,
     tol = 1e-6,
     backtrack = 100,
     maxiter = 10^4
@@ -149,7 +146,7 @@ function run_benchmark!(generate_data, results, Δ, family, link, seed)
   # Collect results and write to DataFrame
   stats = statistics(Δ)
   niter, tobs, vmod = timed_result.value
-  logl = SpatialRegression.eval_loglikelihood(tobs, vmod)
+  logl = SpatialRegression.eval_loglikelihood(tobs, vmod, SpatialRegression.L2Squared())
   timing = timed_result.time  
   B = hcat([v.beta for v in vmod]...)
   yhat = SpatialRegression.predict(X, S, vmod, Δ)
@@ -179,7 +176,7 @@ function run_benchmarks(scenario, seed)
   results = init_table()
   instances = NamedTuple[]
   for Δ in scenario.triangulations
-    prob = run_benchmark!(scenario.data, results, Δ, scenario.family, scenario.link, seed)
+    prob = run_benchmark!(scenario.data, results, Δ, scenario.family, scenario.link, seed, scenario.rho)
     push!(instances, prob)
   end
   return results, instances
@@ -227,6 +224,7 @@ function main()
       data    = Δ -> simulate_data(n, p, Δ, Normal(0.0, 0.1), IdentityLink()),
       family  = Normal(),
       link    = IdentityLink(),
+      rho     = 1e-2,
       triangulations = Δs,
     ),
     #
@@ -237,6 +235,7 @@ function main()
       data    = Δ -> simulate_data(n, p, Δ, Binomial(), LogitLink()),
       family  = Binomial(),
       link    = LogitLink(),
+      rho     = 1e0,
       triangulations = Δs,
     ),
     #
@@ -247,6 +246,7 @@ function main()
       data    = Δ -> simulate_data(n, p, Δ, Poisson(), LogLink()),
       family  = Poisson(),
       link    = LogLink(),
+      rho     = 1e2,
       triangulations = Δs,
     ),
   ];
