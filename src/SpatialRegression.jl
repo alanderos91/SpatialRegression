@@ -5,6 +5,7 @@ using StaticArrays
 using Distributions
 using ForwardDiff
 using DelaunayTriangulation
+using OhMyThreads
 
 import Distributions: loglikelihood
 
@@ -84,7 +85,7 @@ end
 
 is_inside_mesh(Δ::Triangulation) = Base.Fix1(is_inside_mesh, Δ)
 
-function create_triobs_sets(y, X, S, tri)
+function create_triobs_sets(y, X, S, tri; nchunks::Int = Threads.nthreads())
   # Get points + mapping to solid vertices.
   # The mapping is needed to ensure vertex label = index into some array
   vertex = get_points(tri)
@@ -97,26 +98,40 @@ function create_triobs_sets(y, X, S, tri)
     id2vertex[id] = j
   end
 
-  # Retrieve each triangle, sorting indices in ascending order
-  # TODO: This step is a bottleneck and slows create_triobs_sets() when the number of units is large.
-  dict = Dict{Tuple{Int,Int,Int},Vector{Int}}()
-  for (i, s) in enumerate(eachcol(S))
-    j, k, l = find_triangle(tri, s, concavity_protection = true)
-    triidx = sort((id2vertex[j], id2vertex[k], id2vertex[l]))
-    if !haskey(dict, triidx)
-      dict[triidx] = Int[]
+  TriType = Tuple{Int,Int,Int}
+  IdxType = Vector{Int}
+  itr = OhMyThreads.ChannelLike(axes(S, 2))
+  tmp = OhMyThreads.@localize tri id2vertex itr OhMyThreads.tmap(Dict{TriType,IdxType}, 1:nchunks; chunking = false) do _
+    local dict = Dict{TriType,IdxType}()
+    map(itr) do i
+      if iszero(i)
+        triidx = (0, 0, 0)
+      else
+        s = view(S, :, i)
+        j, k, l = find_triangle(tri, s, concavity_protection = true)
+        triidx = sort((id2vertex[j], id2vertex[k], id2vertex[l]))
+      end
+      if !haskey(dict, triidx)
+        dict[triidx] = Int[]
+      end
+      push!(dict[triidx], i)
+      return nothing
     end
-    push!(dict[triidx], i)
+    return dict
+  end
+  
+  dict = Dict{TriType,IdxType}()
+  mergewith!(union!, dict, tmp...)
+  n_active = length(keys(dict))
+
+  triobs = Vector{TriangleObs}(undef, n_active)
+  for (i, (triidx, idx)) in enumerate(dict)
+    sort!(idx) # mitigate random access patterns as much as possible
+    v = V[:, [triidx[1], triidx[2], triidx[3]]]
+    A = barycentric(view(S, :, idx), v)
+    triobs[i] = TriangleObs(triidx, idx, y[idx], X[idx, :], A, v)
   end
 
-  triobs = TriangleObs[]
-  k = 0
-  for (triidx, idx) in dict
-    k += 1
-    Vₖ = V[:, [triidx[1], triidx[2], triidx[3]]]
-    A = barycentric(view(S, :, idx), Vₖ)
-    push!(triobs, TriangleObs(triidx, idx, y[idx], X[idx, :], A, Vₖ))
-  end
   return triobs
 end
 
