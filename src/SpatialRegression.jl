@@ -98,6 +98,7 @@ function create_triobs_sets(y, X, S, tri; nchunks::Int = Threads.nthreads())
     id2vertex[id] = j
   end
 
+  # Assign each observation to a triangle in parallel
   TriType = Tuple{Int,Int,Int}
   IdxType = Vector{Int}
   itr = OhMyThreads.ChannelLike(axes(S, 2))
@@ -120,10 +121,12 @@ function create_triobs_sets(y, X, S, tri; nchunks::Int = Threads.nthreads())
     return dict
   end
   
+  # Aggregate results across tasks
   dict = Dict{TriType,IdxType}()
   mergewith!(union!, dict, tmp...)
   n_active = length(keys(dict))
 
+  # Create TriangleObs for each 'active' triangle
   triobs = Vector{TriangleObs}(undef, n_active)
   for (i, (triidx, idx)) in enumerate(dict)
     sort!(idx) # mitigate random access patterns as much as possible
@@ -514,6 +517,86 @@ function initialize_coefficients!(v::VertexModel, tobs, vmod)
   return nothing
 end
 
+function mm_update!(penalty, vⱼ, vmod, tobs, workspace)
+  # Setup local variables to match notation
+  β = vⱼ.beta
+  Γ = vⱼ.gamma
+  d = vⱼ.d
+  r = vⱼ.workres
+  η = vⱼ.eta
+  μ = vⱼ.mu
+  w = vⱼ.weights
+  ∇L, ∇²L, search_direction = workspace
+  
+  idx = 1; fill!(∇L, 0); fill!(∇²L, 0)
+  if isempty(vⱼ.triangles)
+    # Case: Incident observation sets are empty
+    update_empty_case!(penalty, vⱼ, w, Γ)
+  else
+    # Case: Incident observation sets are not empty
+    for triidx in vⱼ.triangles
+      T = tobs[triidx]
+      A, y, X = T.A, T.y, T.X
+      t, v = get_triangle_vertices(T, vⱼ.index, vmod)
+
+      # Compute weights and working residuals
+      for i in eachindex(y)
+        x = view(X, i, :)
+        a = view(A, :, i)
+
+        zweight = stable_eval_mm_weight(t, a, v, y[i], x)
+        η[idx] = dot(x, β)
+        μ[idx], dμdη = GLM.inverselink(vⱼ.link, η[idx])
+        r[idx] = (y[i] - μ[idx]) / dμdη
+        d[idx] = zweight * dμdη^2 / stable_glmvar(vⱼ.family, μ[idx], η[idx])
+        # if isnan(d[idx]) || isinf(d[idx]) || isnan(r[idx]) || isinf(r[idx])
+        #   error("Encountered underflow/overflow. Check arrays!")
+        # end
+        idx += 1
+      end
+
+      # Evaluate gradient + Hessian
+      idxrange = (idx-length(y)):(idx-1)
+      dd = view(d, idxrange)
+      rr = view(r, idxrange)
+      @inbounds for k in axes(X, 1)
+        xx = view(X, k, :)
+        BLAS.axpy!(dd[k] * rr[k], xx, ∇L)
+        BLAS.syr!('U', dd[k], xx, ∇²L)
+      end
+    end
+
+    accumulate_penalty_derivs!(penalty, ∇L, ∇²L, vⱼ.rho, β, w, Γ)
+    # gg = ForwardDiff.gradient(b -> eval_surrogate(b, vⱼ.index, Γ, w, rho, vmod, tobs, penalty), β)
+    # hh = ForwardDiff.hessian(b -> -eval_surrogate(b, vⱼ.index, Γ, w, rho, vmod, tobs, penalty), β)
+    # @show norm(gg - ∇L)
+    # @show norm(Symmetric(hh, :U) - Symmetric(∇²L, :U))
+    ldiv!(search_direction, cholesky!(Symmetric(∇²L, :U)), ∇L)
+    # ldiv!(search_direction, cholesky!(Symmetric(hh, :U)), ∇L)
+    # @. vⱼ.beta_new = β + search_direction
+  end
+end
+
+function linesearch!(βₙ₊₁, βₙ, Δ, objective, backtrack, index, gamma, weights, rho, vmod, tobs, penalty)
+  # Backtracking line search
+  t = 1.0
+  for step in 0:backtrack
+    @. βₙ₊₁ = βₙ + t * Δ
+    objective_new = eval_surrogate(βₙ₊₁, index, gamma, weights, rho, vmod, tobs, penalty)
+    if objective_new >= objective
+      break
+    elseif step < backtrack
+      t /= 2
+    else
+      @show t, objective_new, objective
+      error("Backtracking failed at iteration $(iter) for vertex $(vⱼ.index) after $(step) attempts!")
+      @. βₙ₊₁ = βₙ
+      break
+    end
+  end
+  return t, step
+end
+
 function fitmodel(yfull, Xfull, Sfull, tri;
     maxiter::Int = 100,
     backtrack::Int = 5,
@@ -522,18 +605,19 @@ function fitmodel(yfull, Xfull, Sfull, tri;
     link::Link = GLM.canonicallink(family),
     rho::Real = 1.0,
     penalty::PT = L2Squared(),
+    nchunks::Int = Threads.nthreads(),
     # intercept = all(isequal(1), view(Xfull, :, 1)),
   ) where PT <: AbstractPenalty
   # Initialize
   nvars = size(Xfull, 2)
-  tobs = create_triobs_sets(yfull, Xfull, Sfull, tri)
+  tobs = create_triobs_sets(yfull, Xfull, Sfull, tri; nchunks = 4*nchunks)
   vmod = create_vertexmodel_set(family, link, tri, tobs, nvars; rho = rho)
   # initialize_coefficients!(tobs, vmod)
   logl = eval_loglikelihood(tobs, vmod, penalty)
   logl_prev = zero(logl)
-  ∇L = zeros(nvars)
-  ∇²L = zeros(nvars, nvars)
-  search_direction = zeros(nvars)
+
+  BLAS_THREADS = BLAS.get_num_threads()
+  cache = [(zeros(nvars), zeros(nvars, nvars), zeros(nvars)) for _ in 1:nchunks]
 
   iter = 0
   while iter < maxiter && abs(logl - logl_prev) > (1 + abs(logl_prev)) * tol
@@ -543,84 +627,30 @@ function fitmodel(yfull, Xfull, Sfull, tri;
     eval_gamma!(vmod)
 
     # Visit each vertex once to update local parameters
-    for vⱼ in vmod
-      # Setup local variables to match notation
-      β = vⱼ.beta
-      Γ = vⱼ.gamma
-      d = vⱼ.d
-      r = vⱼ.workres
-      η = vⱼ.eta
-      μ = vⱼ.mu
-      w = vⱼ.weights
+    workspace = OhMyThreads.ChannelLike(cache)
+    workitr = OhMyThreads.ChannelLike(vmod)
+    try
+      BLAS.set_num_threads(max(1, div(BLAS_THREADS, nchunks)))
+      OhMyThreads.@localize iter tobs vmod nvars OhMyThreads.tforeach(1:nchunks; chunking = false) do _
+        map(workspace) do (∇L, ∇²L, search_direction)
 
-      objective = eval_surrogate(vⱼ.beta, vⱼ.index, Γ, w, vⱼ.rho, vmod, tobs, penalty)
-      isinf(objective) && display(vⱼ.beta)
-      
-      idx = 1; fill!(∇L, 0); fill!(∇²L, 0)
-      if isempty(vⱼ.triangles)
-        # Case: Incident observation sets are empty
-        update_empty_case!(penalty, vⱼ, w, Γ)
-      else
-        # Case: Incident observation sets are not empty
-        for triidx in vⱼ.triangles
-          T = tobs[triidx]
-          A, y, X = T.A, T.y, T.X
-          t, v = get_triangle_vertices(T, vⱼ.index, vmod)
-
-          # Compute weights and working residuals
-          for i in eachindex(y)
-            x = view(X, i, :)
-            a = view(A, :, i)
-
-            zweight = stable_eval_mm_weight(t, a, v, y[i], x)
-            η[idx] = dot(x, β)
-            μ[idx], dμdη = GLM.inverselink(vⱼ.link, η[idx])
-            r[idx] = (y[i] - μ[idx]) / dμdη
-            d[idx] = zweight * dμdη^2 / stable_glmvar(vⱼ.family, μ[idx], η[idx])
-            # if isnan(d[idx]) || isinf(d[idx]) || isnan(r[idx]) || isinf(r[idx])
-            #   error("Encountered underflow/overflow. Check arrays!")
-            # end
-            idx += 1
-          end
-
-          # Evaluate gradient + Hessian
-          idxrange = (idx-length(y)):(idx-1)
-          dd = view(d, idxrange)
-          rr = view(r, idxrange)
-          @inbounds for k in axes(X, 1)
-            xx = view(X, k, :)
-            BLAS.axpy!(dd[k] * rr[k], xx, ∇L)
-            BLAS.syr!('U', dd[k], xx, ∇²L)
-          end
-        end
-
-        accumulate_penalty_derivs!(penalty, ∇L, ∇²L, rho, β, w, Γ)
-        # gg = ForwardDiff.gradient(b -> eval_surrogate(b, vⱼ.index, Γ, w, rho, vmod, tobs, penalty), β)
-        # hh = ForwardDiff.hessian(b -> -eval_surrogate(b, vⱼ.index, Γ, w, rho, vmod, tobs, penalty), β)
-        # @show norm(gg - ∇L)
-        # @show norm(Symmetric(hh, :U) - Symmetric(∇²L, :U))
-        ldiv!(search_direction, cholesky!(Symmetric(∇²L, :U)), ∇L)
-        # ldiv!(search_direction, cholesky!(Symmetric(hh, :U)), ∇L)
-        # @. vⱼ.beta_new = β + search_direction
-
-        # Backtracking line search
-        t = 1.0
-        vⱼ.beta_new .= β
-        for step in 0:backtrack
-          @. vⱼ.beta_new = β + t * search_direction
-          objective_new = eval_surrogate(vⱼ.beta_new, vⱼ.index, Γ, w, vⱼ.rho, vmod, tobs, penalty)
-          if objective_new >= objective
-            break
-          elseif step < backtrack
-            t /= 2
-          else
-            @show t, objective_new, objective
-            error("Backtracking failed at iteration $(iter) for vertex $(vⱼ.index) after $(step) attempts!")
-            @. vⱼ.beta_new = β
-            break
+          map(workitr) do vⱼ
+            objective = eval_surrogate(vⱼ.beta, vⱼ.index, vⱼ.gamma, vⱼ.weights, vⱼ.rho, vmod, tobs, penalty)
+            isinf(objective) && display(vⱼ.beta)
+            mm_update!(penalty, vⱼ, vmod, tobs, (∇L, ∇²L, search_direction))
+            linesearch!(
+              vⱼ.beta_new,
+              vⱼ.beta,
+              search_direction,
+              objective,
+              backtrack,
+              vⱼ.index, vⱼ.gamma, vⱼ.weights, vⱼ.rho, vmod, tobs, penalty
+            )
           end
         end
       end
+    finally
+      BLAS.set_num_threads(BLAS_THREADS)
     end
 
     # Apply all updates
