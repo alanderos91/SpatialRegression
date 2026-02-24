@@ -1,9 +1,9 @@
-function eval_surrogate(tobs, vmod, j, penalty_type::AbstractPenalty)
+function eval_surrogate(tobs, vmod, j, penalty_type::AbstractPenalty, caches)
   v = vmod[j]
-  eval_surrogate(v.beta, v.index, v.gamma, v.weights, v.rho, vmod, tobs, penalty_type)
+  eval_surrogate(v.beta, v.index, v.gamma, v.weights, v.rho, vmod, tobs, penalty_type, caches)
 end
 
-function eval_surrogate(beta, j, gamma, weights, rho, vmod, tobs, penalty_type::AbstractPenalty)
+function eval_surrogate(beta, j, gamma, weights, rho, vmod, tobs, penalty_type::AbstractPenalty, caches)
   logl, vⱼ = zero(Float64), vmod[j]
 
   # Log-Likelihood
@@ -11,16 +11,18 @@ function eval_surrogate(beta, j, gamma, weights, rho, vmod, tobs, penalty_type::
     T = tobs[triidx]
     A, y, X = T.A, T.y, T.X
     t, v = get_triangle_vertices(T, j, vmod)
-    
+    cache = caches[triidx]
+
     for i in eachindex(T.y)
       x = view(X, i, :)
       a = view(A, :, i)
+      logf = view(cache, :, i)
 
       # Evaluate log-likelihood term at β
       logfⱼ = loglik_obs(beta, y[i], x, vⱼ.family, vⱼ.link)
 
       # Evaluate terms dependent on the anchor point βₙ
-      zweight = stable_eval_mm_weight(t, a, v, y[i], x)
+      zweight = stable_eval_mm_weight(t, a, logf)
 
       logl += zweight * logfⱼ + zweight * (log(a[t]) + log(inv(zweight)))
     end
@@ -69,7 +71,7 @@ function eval_gamma!(vmod)
   end
 end
 
-function mm_update!(penalty, vⱼ, vmod, tobs, workspace)
+function mm_update!(penalty, vⱼ, vmod, tobs, workspace, caches)
   # Setup local variables to match notation
   β = vⱼ.beta
   Γ = vⱼ.gamma
@@ -90,14 +92,16 @@ function mm_update!(penalty, vⱼ, vmod, tobs, workspace)
       T = tobs[triidx]
       A, y, X = T.A, T.y, T.X
       t, v = get_triangle_vertices(T, vⱼ.index, vmod)
+      cache = caches[triidx]
 
       # Compute weights and working residuals
       for i in eachindex(y)
         x = view(X, i, :)
         a = view(A, :, i)
+        logf = view(cache, :, i)
 
-        zweight = stable_eval_mm_weight(t, a, v, y[i], x)
-        η[idx] = dot(x, β)
+        zweight = stable_eval_mm_weight(t, a, logf)
+        # η[idx] = dot(x, β)
         μ[idx], dμdη = GLM.inverselink(vⱼ.link, η[idx])
         r[idx] = (y[i] - μ[idx]) / dμdη
         d[idx] = zweight * dμdη^2 / stable_glmvar(vⱼ.family, μ[idx], η[idx])

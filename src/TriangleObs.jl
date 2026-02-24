@@ -2,8 +2,9 @@ struct TriangleObs
   triangle::Tuple{Int,Int,Int} # indices in ascending order
   idx::Vector{Int}    # set of indices into original data (y, X)
   y::Vector{Float64}  # response local to triangle
-  X::Matrix{Float64}  # covariates local to triangle
-  A::Matrix{Float64}  # mixture weights as barycentric coordinates
+  X::Matrix{Float64}  # covariates local to triangle, stored in rows
+  S::Matrix{Float64}  # Cartesian coordiantes, stored in columns
+  A::Matrix{Float64}  # mixture weights as barycentric coordinates, stored in columns
   V::Matrix{Float64}  # vertices of triangle, stored in columns
 end
 
@@ -52,9 +53,10 @@ function create_triobs_sets(y, X, S, tri; nchunks::Int = Threads.nthreads())
   triobs = Vector{TriangleObs}(undef, n_active)
   for (i, (triidx, idx)) in enumerate(dict)
     sort!(idx) # mitigate random access patterns as much as possible
-    v = V[:, [triidx[1], triidx[2], triidx[3]]]
-    A = barycentric(view(S, :, idx), v)
-    triobs[i] = TriangleObs(triidx, idx, y[idx], X[idx, :], A, v)
+    Vₜ = V[:, [triidx[1], triidx[2], triidx[3]]]
+    Sₜ = S[:, idx]
+    Aₜ = barycentric(Sₜ, Vₜ)
+    triobs[i] = TriangleObs(triidx, idx, y[idx], X[idx, :], Sₜ, Aₜ, Vₜ)
   end
 
   return triobs
@@ -69,6 +71,12 @@ Returns `pos` as one of `1`, `2`, or `3` along with a tuple of vertices.
 """
 function get_triangle_vertices(T::TriangleObs, index, vmod)
   j, k, l = T.triangle
+  pos = get_triangle_vertices(T, index)
+  return pos, (vmod[j], vmod[k], vmod[l])
+end
+
+function get_triangle_vertices(T::TriangleObs, index)
+  j, k, l = T.triangle
   if index == j
     pos = 1
   elseif index == k
@@ -78,5 +86,5 @@ function get_triangle_vertices(T::TriangleObs, index, vmod)
   else
     error("The index $(index) is not in the triangle $(T.triangle).")
   end
-  return pos, (vmod[j], vmod[k], vmod[l])
+  return pos
 end

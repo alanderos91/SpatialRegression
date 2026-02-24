@@ -37,7 +37,7 @@ The index `t` indicates which vertex of `(v[1], v[2], v[3])` is the argument of 
 
 Returns the MM weight.
 """
-function stable_eval_mm_weight(t::Integer, a::AbstractVector{T}, logf::NTuple{3,T}) where T <: Real
+function stable_eval_mm_weight(t::Integer, a::AbstractVector{T}, logf) where T <: Real
   s, c = stable_explogsum(a, logf)
   if isinf(c)
     zweight = one(c)        

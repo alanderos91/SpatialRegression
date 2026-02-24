@@ -62,12 +62,12 @@ is_inside_mesh(Δ::Triangulation) = Base.Fix1(is_inside_mesh, Δ)
 #
 # LINESEARCH
 #
-function linesearch!(βₙ₊₁, βₙ, Δ, objective, backtrack, index, gamma, weights, rho, vmod, tobs, penalty)
+function linesearch!(βₙ₊₁, βₙ, Δ, objective, backtrack, index, gamma, weights, rho, vmod, tobs, penalty, caches)
   # Backtracking line search
   t = 1.0
   for step in 0:backtrack
     @. βₙ₊₁ = βₙ + t * Δ
-    objective_new = eval_surrogate(βₙ₊₁, index, gamma, weights, rho, vmod, tobs, penalty)
+    objective_new = eval_surrogate(βₙ₊₁, index, gamma, weights, rho, vmod, tobs, penalty, caches)
     if objective_new >= objective
       break
     elseif step < backtrack
@@ -80,4 +80,90 @@ function linesearch!(βₙ₊₁, βₙ, Δ, objective, backtrack, index, gamma,
     end
   end
   return t, step
+end
+#
+# LOG-LIKELIHOOD
+#
+function eval_and_cache_loglikelihoods!(caches, v::VertexModel, tobs)
+  i_start = 1
+  j, β, η = v.index, v.beta, v.eta
+  family, link = v.family, v.link
+  i_start = 1
+  for triidx in v.triangles
+    T = tobs[triidx]
+    y, X = T.y, T.X
+    t = get_triangle_vertices(T, j)
+    n = length(y)
+    logl = view(caches[triidx], t, :)
+    idxrange = i_start:(i_start+n-1)
+    mul!(view(η, idxrange), X, β) # η = Xβ
+    for (i, idx) in enumerate(idxrange)
+      μ, _ = GLM.inverselink(link, η[idx])
+      logl[i] = GLM.loglik_obs(family, y[i], μ, 1, 1)
+    end
+    i_start += n
+  end
+  return caches
+end
+
+function eval_and_cache_loglikelihoods!(caches, vmod, tobs; nchunks::Int = Threads.nthreads())
+  workitr = OhMyThreads.ChannelLike(vmod)
+  BLAS_THREADS = BLAS.get_num_threads()
+  try
+    BLAS.set_num_threads(max(1, div(BLAS_THREADS, nchunks)))
+    OhMyThreads.@localize caches vmod tobs OhMyThreads.tforeach(1:nchunks; chunking = false) do _
+      map(workitr) do v
+        eval_and_cache_loglikelihoods!(caches, v, tobs)
+      end
+    end
+  finally
+    BLAS.set_num_threads(BLAS_THREADS)
+  end
+end
+
+function eval_loglikelihoodA(tobs, vmod, penalty_type)
+  logl = zero(Float64)
+  for T in tobs
+    A, y, X = T.A, T.y, T.X
+    _, v = get_triangle_vertices(T, T.triangle[1], vmod)
+    for i in eachindex(y)
+      x = view(X, i, :)
+      a = view(A, :, i)
+
+      # evaluate log-likelihood at each vertex
+      logf = eval_loglikelihoods(v, y[i], x)
+      
+      # shift log(∑ⱼ αⱼ exp(fⱼ)) by the most negative log-likelihood
+      logl += stable_logsumexp(a, logf)
+    end
+  end
+
+  penalty = eval_penalty(penalty_type, vmod)
+
+  return logl + penalty
+end
+
+function eval_loglikelihoodB(tobs, vmod, penalty_type, caches; nchunks::Int = Threads.nthreads())
+  eval_and_cache_loglikelihoods!(caches, vmod, tobs; nchunks)
+
+  logl = OhMyThreads.@localize tobs caches OhMyThreads.@tasks for triidx in eachindex(tobs)
+    OhMyThreads.@set begin
+      ntasks = nchunks
+      reducer = +
+    end
+    T = tobs[triidx]
+    A = T.A
+    cache = caches[triidx]
+    local logl = zero(Float64)
+    for i in axes(A, 2)
+      a = view(A, :, i)
+      logf = view(cache, :, i)
+      logl += stable_logsumexp(a, logf)
+    end
+    logl
+  end
+
+  penalty = eval_penalty(penalty_type, vmod)
+
+  return sum(logl) + penalty
 end
