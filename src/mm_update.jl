@@ -1,0 +1,130 @@
+function eval_surrogate(tobs, vmod, j, penalty_type::AbstractPenalty)
+  v = vmod[j]
+  eval_surrogate(v.beta, v.index, v.gamma, v.weights, v.rho, vmod, tobs, penalty_type)
+end
+
+function eval_surrogate(beta, j, gamma, weights, rho, vmod, tobs, penalty_type::AbstractPenalty)
+  logl, vⱼ = zero(Float64), vmod[j]
+
+  # Log-Likelihood
+  for triidx in vⱼ.triangles
+    T = tobs[triidx]
+    A, y, X = T.A, T.y, T.X
+    t, v = get_triangle_vertices(T, j, vmod)
+    
+    for i in eachindex(T.y)
+      x = view(X, i, :)
+      a = view(A, :, i)
+
+      # Evaluate log-likelihood term at β
+      logfⱼ = loglik_obs(beta, y[i], x, vⱼ.family, vⱼ.link)
+
+      # Evaluate terms dependent on the anchor point βₙ
+      zweight = stable_eval_mm_weight(t, a, v, y[i], x)
+
+      logl += zweight * logfⱼ + zweight * (log(a[t]) + log(inv(zweight)))
+    end
+  end
+
+  # Penalty
+  penalty = eval_penalty_surrogate(penalty_type, rho, beta, weights, gamma, vⱼ.beta)
+
+  return logl + penalty
+end
+
+function update_empty_case!(::L2Squared, v, weights, gamma)
+  mul!(v.beta_new, gamma, weights)
+  sumw = sum(weights)
+  @. v.beta_new = v.beta_new / sumw
+  return nothing
+end
+
+function update_empty_case!(p::L1Approx, v, weights, gamma)
+  epsilon = p.epsilon
+  beta = v.beta
+  for k in eachindex(beta)
+    num, den = zero(Float64), zero(Float64)
+    for (idx, γ) in enumerate(eachcol(gamma))
+      eta = beta[k] - γ[k]
+      q = l1apx(eta, epsilon/2)
+      num += γ[k] * weights[idx] / q
+      den += weights[idx] / q
+    end
+    v.beta_new[k] = num / den
+  end
+  return nothing
+end
+
+function eval_gamma!(vmod)
+  for v in vmod
+    β = v.beta
+    Γ = v.gamma
+    for (idx, k) in enumerate(v.neighbors)
+      if v.index == k continue end
+      βₖ = vmod[k].beta
+      @views begin
+        @. Γ[:, idx] = 1//2 * (β + βₖ)
+      end
+    end
+  end
+end
+
+function mm_update!(penalty, vⱼ, vmod, tobs, workspace)
+  # Setup local variables to match notation
+  β = vⱼ.beta
+  Γ = vⱼ.gamma
+  d = vⱼ.d
+  r = vⱼ.workres
+  η = vⱼ.eta
+  μ = vⱼ.mu
+  w = vⱼ.weights
+  ∇L, ∇²L, search_direction = workspace
+  
+  idx = 1; fill!(∇L, 0); fill!(∇²L, 0)
+  if isempty(vⱼ.triangles)
+    # Case: Incident observation sets are empty
+    update_empty_case!(penalty, vⱼ, w, Γ)
+  else
+    # Case: Incident observation sets are not empty
+    for triidx in vⱼ.triangles
+      T = tobs[triidx]
+      A, y, X = T.A, T.y, T.X
+      t, v = get_triangle_vertices(T, vⱼ.index, vmod)
+
+      # Compute weights and working residuals
+      for i in eachindex(y)
+        x = view(X, i, :)
+        a = view(A, :, i)
+
+        zweight = stable_eval_mm_weight(t, a, v, y[i], x)
+        η[idx] = dot(x, β)
+        μ[idx], dμdη = GLM.inverselink(vⱼ.link, η[idx])
+        r[idx] = (y[i] - μ[idx]) / dμdη
+        d[idx] = zweight * dμdη^2 / stable_glmvar(vⱼ.family, μ[idx], η[idx])
+        # if isnan(d[idx]) || isinf(d[idx]) || isnan(r[idx]) || isinf(r[idx])
+        #   error("Encountered underflow/overflow. Check arrays!")
+        # end
+        idx += 1
+      end
+
+      # Evaluate gradient + Hessian
+      idxrange = (idx-length(y)):(idx-1)
+      dd = view(d, idxrange)
+      rr = view(r, idxrange)
+      @inbounds for k in axes(X, 1)
+        xx = view(X, k, :)
+        BLAS.axpy!(dd[k] * rr[k], xx, ∇L)
+        BLAS.syr!('U', dd[k], xx, ∇²L)
+      end
+    end
+
+    accumulate_penalty_derivs!(penalty, ∇L, ∇²L, vⱼ.rho, β, w, Γ)
+    # gg = ForwardDiff.gradient(b -> eval_surrogate(b, vⱼ.index, Γ, w, rho, vmod, tobs, penalty), β)
+    # hh = ForwardDiff.hessian(b -> -eval_surrogate(b, vⱼ.index, Γ, w, rho, vmod, tobs, penalty), β)
+    # @show norm(gg - ∇L)
+    # @show norm(Symmetric(hh, :U) - Symmetric(∇²L, :U))
+    ldiv!(search_direction, cholesky!(Symmetric(∇²L, :U)), ∇L)
+    # ldiv!(search_direction, cholesky!(Symmetric(hh, :U)), ∇L)
+    # @. vⱼ.beta_new = β + search_direction
+  end
+end
