@@ -64,21 +64,30 @@ end
 
 function initialize_coefficients!(v::VertexModel, tobs, vmod)
   p = length(v.beta)
+  ∇L, ∇²L = zeros(p), zeros(p, p)
+  i_start = 1
   for triidx in v.triangles
     T = tobs[triidx]
-    j, k, l = T.triangle
-    
-    # Solve linear system associated with triangle
-    η = GLM.linkfun.(v.link, T.y)
-    X = [Diagonal(T.A[1,:])*T.X Diagonal(T.A[2,:])*T.X Diagonal(T.A[3,:])*T.X]
-    β = [vmod[j].beta; vmod[k].beta; vmod[l].beta]
-    β .= X \ η
-
-    # Average solutions over incident triangles for each vertex
-    for (r, u) in enumerate((vmod[j], vmod[k], vmod[l]))
-      u.beta .+= 1/length(u.triangles) * β[p*(r-1)+1 : p*r]
+    y, X = T.y, T.X
+    n = length(y)
+    idxrange = i_start:(i_start+n-1)
+    for (i, idx) in enumerate(idxrange)
+      v.mu[idx] = GLM.mustart(v.family, y[i], one(Float64))
+      v.eta[idx] = GLM.linkfun(v.link, v.mu[idx])
+      v.mu[idx], dμdη = GLM.inverselink(v.link, v.eta[idx])
+      v.workres[idx] = (y[i] - v.mu[idx]) / dμdη
+      v.d[idx] = dμdη^2 / stable_glmvar(v.family, v.mu[idx], v.eta[idx])
     end
+    dd = view(v.d, idxrange)
+    rr = view(v.workres, idxrange)
+    @inbounds for k in axes(X, 1)
+      xx = view(X, k, :)
+      BLAS.axpy!(dd[k] * rr[k], xx, ∇L)
+      BLAS.syr!('U', dd[k], xx, ∇²L)
+    end
+    i_start += n
   end
+  ldiv!(v.beta, cholesky!(Symmetric(∇²L, :U)), ∇L)
   return nothing
 end
 
@@ -97,7 +106,7 @@ function fitmodel(yfull, Xfull, Sfull, tri;
   nvars = size(Xfull, 2)
   tobs = create_triobs_sets(yfull, Xfull, Sfull, tri; nchunks = 4*nchunks)
   vmod = create_vertexmodel_set(family, link, tri, tobs, nvars; rho = rho)
-  # initialize_coefficients!(tobs, vmod)
+  initialize_coefficients!(tobs, vmod)
   # logl = eval_loglikelihood(tobs, vmod, penalty)
   logf_cache = Dict(triidx => zeros(3, length(T.y)) for (triidx, T) in enumerate(tobs))
   logl = eval_loglikelihoodB(tobs, vmod, penalty, logf_cache; nchunks = nchunks)
@@ -129,6 +138,7 @@ function fitmodel(yfull, Xfull, Sfull, tri;
               vⱼ.beta_new,
               vⱼ.beta,
               search_direction,
+              iter,
               objective,
               backtrack,
               vⱼ.index, vⱼ.gamma, vⱼ.weights, vⱼ.rho, vmod, tobs, penalty, logf_cache

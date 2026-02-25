@@ -62,19 +62,19 @@ is_inside_mesh(Δ::Triangulation) = Base.Fix1(is_inside_mesh, Δ)
 #
 # LINESEARCH
 #
-function linesearch!(βₙ₊₁, βₙ, Δ, objective, backtrack, index, gamma, weights, rho, vmod, tobs, penalty, caches)
+function linesearch!(βₙ₊₁, βₙ, Δ, iter, objective, backtrack, index, gamma, weights, rho, vmod, tobs, penalty, caches)
   # Backtracking line search
-  t = 1.0
+  t = 10.0
   for step in 0:backtrack
     @. βₙ₊₁ = βₙ + t * Δ
     objective_new = eval_surrogate(βₙ₊₁, index, gamma, weights, rho, vmod, tobs, penalty, caches)
-    if objective_new >= objective
+    if objective_new >= objective + objective_new * 1e-6
       break
     elseif step < backtrack
       t /= 2
     else
       @show t, objective_new, objective
-      error("Backtracking failed at iteration $(iter) for vertex $(vⱼ.index) after $(step) attempts!")
+      @warn("Backtracking failed at iteration $(iter) for vertex $(index) after $(step) attempts!")
       @. βₙ₊₁ = βₙ
       break
     end
