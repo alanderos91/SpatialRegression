@@ -130,21 +130,25 @@ function fitmodel(yfull, Xfull, Sfull, tri;
         map(workspace) do (∇L, ∇²L, search_direction)
 
           map(workitr) do vⱼ
-            objective = eval_surrogate(vⱼ.beta, vⱼ.index, vⱼ.gamma, vⱼ.weights, vⱼ.rho, vmod, tobs, penalty, logf_cache)
-            if isinf(objective) || isnan(objective)
-              println("Vertex ", vⱼ.index, " Iteration ", iter)
-              display(vⱼ.beta)
+            if isempty(vⱼ.triangles)
+              update_empty_case!(penalty, vⱼ, vⱼ.weights, vⱼ.gamma)
+            else
+              objective = eval_surrogate(vⱼ.beta, vⱼ.index, vⱼ.gamma, vⱼ.weights, vⱼ.rho, vmod, tobs, penalty, logf_cache)
+              if isinf(objective) || isnan(objective)
+                println("Vertex ", vⱼ.index, " Iteration ", iter)
+                display(vⱼ.beta)
+              end
+              mm_update!(penalty, vⱼ, vmod, tobs, (∇L, ∇²L, search_direction), logf_cache)
+              linesearch!(
+                vⱼ.beta_new,
+                vⱼ.beta,
+                search_direction,
+                iter,
+                objective,
+                backtrack,
+                vⱼ.index, vⱼ.gamma, vⱼ.weights, vⱼ.rho, vmod, tobs, penalty, logf_cache
+              )
             end
-            mm_update!(penalty, vⱼ, vmod, tobs, (∇L, ∇²L, search_direction), logf_cache)
-            linesearch!(
-              vⱼ.beta_new,
-              vⱼ.beta,
-              search_direction,
-              iter,
-              objective,
-              backtrack,
-              vⱼ.index, vⱼ.gamma, vⱼ.weights, vⱼ.rho, vmod, tobs, penalty, logf_cache
-            )
           end
         end
       end
