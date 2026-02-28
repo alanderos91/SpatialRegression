@@ -1,6 +1,18 @@
 import Pkg
 Pkg.activate(".")
 
+"""
+Benchmarks over an equilateral spatial domain.
+
+Main functions:
+
+- `plot_meshes()`: Plot meshes used in the benchmarks.
+- `get_meshes()`: Retrieve meshes used in the benchmarks.
+- `run_balanced()`: Run benchmarks. Spatial data are sampled uniformly over domain.
+
+"""
+module Equilateral
+
 using LinearAlgebra, Random, Statistics, Distributions
 using DelaunayTriangulation
 using SpatialRegression
@@ -82,7 +94,7 @@ end
 #
 # PLOTS
 #
-function plot_compare_fitted(instances; markersize = 4.0, kwargs...)
+function plot_fitted(instances; markersize = 4.0, kwargs...)
   local W = 400; H = 250
   local NROW = 2; NSCENARIO = length(instances)
 
@@ -208,7 +220,7 @@ function init_triangulation(boundary_points = default_equilateral_domain())
   triangulate_convex(boundary_points, [1, 2, 3]; delete_ghosts = false)
 end
 
-function run_equilateral()
+function get_meshes()
   boundary_points = default_equilateral_domain()
   init_area = 0.5 *
   norm(boundary_points[1] - 0.5*(boundary_points[2] + boundary_points[3])) *
@@ -218,15 +230,24 @@ function run_equilateral()
   Δ₀ = init_triangulation(boundary_points)
   Δ₁ = equilateral_refinement(Δ₀, 0.01*init_area)
   Δ₂ = equilateral_refinement(Δ₁, 0.001*init_area)
-  Δs = (Δ₀, Δ₁, Δ₂);
+  
+  return (Δ₀, Δ₁, Δ₂)
+end
 
+function plot_meshes()
+  Δs = get_meshes()
   figtri = Figure(size = (400*length(Δs), 400));
   for (j, Δ) in enumerate(Δs)
     ax = Axis(figtri[1,j], title = get_tri_title(Δ))
     triplot!(ax, Δ)
   end
-  figtri
-  save("Figure-Meshes.pdf", figtri)
+  save(joinpath("figures", "Equilateral-Meshes.pdf"), figtri)
+  return nothing
+end
+
+function run_balanced()
+  # LOAD MESHES
+  Δs = get_meshes()
 
   # RUN BENCHMARKS
   n, p = 10^4, 10
@@ -243,7 +264,7 @@ function run_equilateral()
       # SCENARIO 1: Uniform over domain, Normal response
       #
       (;
-        name    = "Balanced_Normal",
+        name    = "Balanced-Normal",
         data    = Δ -> simulate_data(n, p, Δ, Normal(0.0, 0.1), IdentityLink()),
         family  = Normal(),
         link    = IdentityLink(),
@@ -255,7 +276,7 @@ function run_equilateral()
       # SCENARIO 2: Uniform over domain, Binomial response
       #
       (;
-        name    = "Balanced_Binomial",
+        name    = "Balanced-Binomial",
         data    = Δ -> simulate_data(n, p, Δ, Binomial(), LogitLink()),
         family  = Binomial(),
         link    = LogitLink(),
@@ -267,7 +288,7 @@ function run_equilateral()
       # SCENARIO 3: Uniform over domain, Poisson response
       #
       (;
-        name    = "Balanced_Poisson",
+        name    = "Balanced-Poisson",
         data    = Δ -> simulate_data(n, p, Δ, Poisson(), LogLink()),
         family  = Poisson(),
         link    = LogLink(),
@@ -282,8 +303,8 @@ function run_equilateral()
     ins = []
     for scenario in scenarios
       results, instances = run_benchmarks(scenario, seed)
-      figure = plot_compare_fitted(instances)
-      save("Figure-$(scenario.name)-$(penalty_name).pdf", figure)
+      figure = plot_fitted(instances)
+      save(joinpath("figures", "Equilateral-$(scenario.name)-$(penalty_name).pdf"), figure)
       push!(tbl, results)
       push!(fig, figure)
       push!(ins, instances)
@@ -292,11 +313,18 @@ function run_equilateral()
     foreach(display, fig)
     foreach(display, tbl)
 
-    open("Table-Balanced-$(penalty_name).txt", "w") do io
+    open(joinpath("tables", "Equilateral-Balanced-$(penalty_name).txt"), "w") do io
       pretty_table(io, vcat(tbl...); backend = :latex)
     end
   end
 end
+end # module
 
-run_equilateral()
+#
+# MAIN
+#
+if !isinteractive()
+  Equilateral.plot_meshes()
+  Equilateral.run_balanced()
+end
 
