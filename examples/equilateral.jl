@@ -208,7 +208,7 @@ function init_triangulation(boundary_points = default_equilateral_domain())
   triangulate_convex(boundary_points, [1, 2, 3]; delete_ghosts = false)
 end
 
-function main()
+function run_equilateral()
   boundary_points = default_equilateral_domain()
   init_area = 0.5 *
   norm(boundary_points[1] - 0.5*(boundary_points[2] + boundary_points[3])) *
@@ -298,5 +298,5 @@ function main()
   end
 end
 
-# main()
+run_equilateral()
 
