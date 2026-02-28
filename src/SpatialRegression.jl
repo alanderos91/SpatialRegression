@@ -106,8 +106,7 @@ function fitmodel(yfull, Xfull, Sfull, tri;
   nvars = size(Xfull, 2)
   tobs = create_triobs_sets(yfull, Xfull, Sfull, tri; nchunks = 4*nchunks)
   vmod = create_vertexmodel_set(family, link, tri, tobs, nvars; rho = rho)
-  initialize_coefficients!(tobs, vmod)
-  # logl = eval_loglikelihood(tobs, vmod, penalty)
+  # initialize_coefficients!(tobs, vmod)
   logf_cache = Dict(triidx => zeros(3, length(T.y)) for (triidx, T) in enumerate(tobs))
   logl = eval_loglikelihoodB(tobs, vmod, penalty, logf_cache; nchunks = nchunks)
   logl_prev = zero(logl)
@@ -132,7 +131,10 @@ function fitmodel(yfull, Xfull, Sfull, tri;
 
           map(workitr) do vⱼ
             objective = eval_surrogate(vⱼ.beta, vⱼ.index, vⱼ.gamma, vⱼ.weights, vⱼ.rho, vmod, tobs, penalty, logf_cache)
-            isinf(objective) && display(vⱼ.beta)
+            if isinf(objective) || isnan(objective)
+              println("Vertex ", vⱼ.index, " Iteration ", iter)
+              display(vⱼ.beta)
+            end
             mm_update!(penalty, vⱼ, vmod, tobs, (∇L, ∇²L, search_direction), logf_cache)
             linesearch!(
               vⱼ.beta_new,
@@ -167,7 +169,7 @@ function fitmodel(yfull, Xfull, Sfull, tri;
     # rel = abs(logl - logl_prev) / (1 + abs(logl_prev))
     # @show iter, logl, logl_prev, rel
   end
-  return iter, tobs, vmod
+  return iter, tobs, vmod, logl
 end
 
 function predict(X, S, vmod, tri)
