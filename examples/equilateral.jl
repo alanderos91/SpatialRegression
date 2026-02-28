@@ -7,6 +7,7 @@ using SpatialRegression
 using CairoMakie
 using DataFrames, PrettyTables
 using SpatialRegression.GLM
+using SpatialRegression: L2Squared, L1Approx
 
 function equilateral_refinement(Δ, max_area)
   Δnew = refine!(deepcopy(Δ),
@@ -40,11 +41,11 @@ function simulate_data(n, p, Δ, family, link)
   vertices = [[get_point(Δ, v)...] for v in each_solid_vertex(Δ)]
   points = get_points(Δ)
   id2vertex = Dict{Int,Int}(id => j for (j, id) in enumerate(each_solid_vertex(Δ)))
-  X = 1/p*rand(n, p)
+  X = 1/p*rand(Uniform(-1, 1), n, p)
   X[:, 1] .= 1
   B = [Bfun(s[1], s[2], j-1, p) for j in 1:p, s in vertices]
   if family isa Poisson
-    B[1, :] .= rand(Uniform(3, 6), size(B, 2))
+    B[1, :] .= rand(Uniform(3, 4), size(B, 2))
     B[2:end, :] .*= 1/4
   else
     B[1, :] .= rand(Uniform(-3, 3), size(B, 2))
@@ -128,25 +129,40 @@ function init_table()
   )
 end
 
-function run_benchmark!(generate_data, results, Δ, family, link, seed, rho)
+function run_benchmark!(generate_data, results, Δ, family, link, seed, rho, penalty)
   # Sample from data generating function
   Random.seed!(seed)
   local y, X, S, B0 = generate_data(Δ)
+  BACKTRACK = 100
+  TOL = 1e-5
+
+  # Precompile
+  @timed SpatialRegression.fitmodel(y, X, S, Δ;
+    family = family,
+    link = link,
+    penalty = penalty,
+    rho = rho,
+    tol = TOL,
+    backtrack = BACKTRACK,
+    maxiter = 10,
+    nchunks = Threads.nthreads()
+  )
 
   # Fit a model with our MM algorithm
   timed_result = @timed SpatialRegression.fitmodel(y, X, S, Δ;
     family = family,
     link = link,
+    penalty = penalty,
     rho = rho,
-    tol = 1e-6,
-    backtrack = 100,
-    maxiter = 10^4
+    tol = TOL,
+    backtrack = BACKTRACK,
+    maxiter = 10^3,
+    nchunks = Threads.nthreads()
   )
 
   # Collect results and write to DataFrame
   stats = statistics(Δ)
-  niter, tobs, vmod = timed_result.value
-  logl = SpatialRegression.eval_loglikelihood(tobs, vmod, SpatialRegression.L2Squared())
+  niter, tobs, vmod, logl = timed_result.value
   timing = timed_result.time  
   B = hcat([v.beta for v in vmod]...)
   yhat = SpatialRegression.predict(X, S, vmod, Δ)
@@ -176,7 +192,7 @@ function run_benchmarks(scenario, seed)
   results = init_table()
   instances = NamedTuple[]
   for Δ in scenario.triangulations
-    prob = run_benchmark!(scenario.data, results, Δ, scenario.family, scenario.link, seed, scenario.rho)
+    prob = run_benchmark!(scenario.data, results, Δ, scenario.family, scenario.link, seed, scenario.rho, scenario.penalty)
     push!(instances, prob)
   end
   return results, instances
@@ -214,62 +230,73 @@ function main()
 
   # RUN BENCHMARKS
   n, p = 10^4, 10
+  RHO = 5e-2
   seed = 1903
-  scenarios = [
-    #
-    # SCENARIO 1: Uniform over domain, Normal response
-    #
-    (;
-      name    = "Balanced_Normal",
-      data    = Δ -> simulate_data(n, p, Δ, Normal(0.0, 0.1), IdentityLink()),
-      family  = Normal(),
-      link    = IdentityLink(),
-      rho     = 1e-2,
-      triangulations = Δs,
-    ),
-    #
-    # SCENARIO 2: Uniform over domain, Binomial response
-    #
-    (;
-      name    = "Balanced_Binomial",
-      data    = Δ -> simulate_data(n, p, Δ, Binomial(), LogitLink()),
-      family  = Binomial(),
-      link    = LogitLink(),
-      rho     = 1e0,
-      triangulations = Δs,
-    ),
-    #
-    # SCENARIO 3: Uniform over domain, Poisson response
-    #
-    (;
-      name    = "Balanced_Poisson",
-      data    = Δ -> simulate_data(n, p, Δ, Poisson(), LogLink()),
-      family  = Poisson(),
-      link    = LogLink(),
-      rho     = 1e2,
-      triangulations = Δs,
-    ),
-  ];
+  penalties = (
+    ("Ridge", L2Squared()),
+    ("L1Smooth", L1Approx(sqrt(1e-8))),
+  )
 
-  fig = Figure[]
-  tbl = DataFrame[]
-  ins = []
-  for scenario in scenarios
-    results, instances = run_benchmarks(scenario, seed)
-    figure = plot_compare_fitted(instances)
-    save("Figure-$(scenario.name).pdf", figure)
-    push!(tbl, results)
-    push!(fig, figure)
-    push!(ins, instances)
-  end
+  for (penalty_name, penalty) in penalties
+    scenarios = [
+      #
+      # SCENARIO 1: Uniform over domain, Normal response
+      #
+      (;
+        name    = "Balanced_Normal",
+        data    = Δ -> simulate_data(n, p, Δ, Normal(0.0, 0.1), IdentityLink()),
+        family  = Normal(),
+        link    = IdentityLink(),
+        rho     = RHO,
+        triangulations = Δs,
+        penalty = penalty,
+      ),
+      #
+      # SCENARIO 2: Uniform over domain, Binomial response
+      #
+      (;
+        name    = "Balanced_Binomial",
+        data    = Δ -> simulate_data(n, p, Δ, Binomial(), LogitLink()),
+        family  = Binomial(),
+        link    = LogitLink(),
+        rho     = RHO,
+        triangulations = Δs,
+        penalty = penalty,
+      ),
+      #
+      # SCENARIO 3: Uniform over domain, Poisson response
+      #
+      (;
+        name    = "Balanced_Poisson",
+        data    = Δ -> simulate_data(n, p, Δ, Poisson(), LogLink()),
+        family  = Poisson(),
+        link    = LogLink(),
+        rho     = RHO,
+        triangulations = Δs,
+        penalty = penalty,
+      ),
+    ];
 
-  foreach(display, fig)
-  foreach(display, tbl)
+    fig = Figure[]
+    tbl = DataFrame[]
+    ins = []
+    for scenario in scenarios
+      results, instances = run_benchmarks(scenario, seed)
+      figure = plot_compare_fitted(instances)
+      save("Figure-$(scenario.name)-$(penalty_name).pdf", figure)
+      push!(tbl, results)
+      push!(fig, figure)
+      push!(ins, instances)
+    end
 
-  open("Table-Balanced.txt", "w") do io
-    pretty_table(io, vcat(tbl...); backend = :latex)
+    foreach(display, fig)
+    foreach(display, tbl)
+
+    open("Table-Balanced-$(penalty_name).txt", "w") do io
+      pretty_table(io, vcat(tbl...); backend = :latex)
+    end
   end
 end
 
-main()
+# main()
 
