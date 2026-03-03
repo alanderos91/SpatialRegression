@@ -17,15 +17,8 @@ function stable_explogsum(a, f)
   return s, c
 end
 
-stable_glmvar(family::Distribution, μ, η) = GLM.glmvar(family, μ)
-
-function stable_glmvar(family::Binomial, μ, η)
-  if iszero(μ) || isone(μ)
-    expabs = exp(-abs(η))
-    return expabs / (1 + 2*expabs + expabs^2) 
-  else
-    return GLM.glmvar(family, μ)
-  end
+function stable_irls_weight(family, link, η, μ, dμdη)
+  return cancancel(family, link) ? dμdη : abs2(dμdη) / varfun(family, μ)
 end
 
 """

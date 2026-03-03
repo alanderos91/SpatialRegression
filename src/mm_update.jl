@@ -11,7 +11,7 @@ function eval_surrogate(beta, j, gamma, weights, rho, vmod, tobs, penalty_type::
     T = tobs[triidx]
     A, y, X = T.A, T.y, T.X
     t, v = get_triangle_vertices(T, j, vmod)
-    cache = caches[triidx]
+    cache = caches.logf[triidx]
 
     for i in eachindex(T.y)
       x = view(X, i, :)
@@ -19,12 +19,15 @@ function eval_surrogate(beta, j, gamma, weights, rho, vmod, tobs, penalty_type::
       logf = view(cache, :, i)
 
       # Evaluate log-likelihood term at β
-      logfⱼ = loglik_obs(beta, y[i], x, vⱼ.family, vⱼ.link)
+      eta = dot(x, beta)
+      mu = meanfun(vⱼ.link, eta)
+      logfⱼ = GLMUtilities.log_likelihood(y[i], mu, eta, vⱼ.family, vⱼ.link)
 
       # Evaluate terms dependent on the anchor point βₙ
       zweight = stable_eval_mm_weight(t, a, logf)
 
-      logl += zweight * logfⱼ + zweight * (log(a[t]) + log(inv(zweight)))
+      tmp = zweight * logfⱼ + zweight * (log(a[t]) + log(inv(zweight)))
+      logl += tmp
     end
   end
 
@@ -92,7 +95,7 @@ function mm_update!(penalty, vⱼ, vmod, tobs, workspace, caches)
       T = tobs[triidx]
       A, y, X = T.A, T.y, T.X
       t, v = get_triangle_vertices(T, vⱼ.index, vmod)
-      cache = caches[triidx]
+      cache = caches.logf[triidx]
 
       # Compute weights and working residuals
       for i in eachindex(y)
@@ -102,12 +105,10 @@ function mm_update!(penalty, vⱼ, vmod, tobs, workspace, caches)
 
         zweight = stable_eval_mm_weight(t, a, logf)
         # η[idx] = dot(x, β)
-        μ[idx], dμdη = GLM.inverselink(vⱼ.link, η[idx])
+        μ[idx] = meanfun(vⱼ.link, η[idx])
+        dμdη   = meanderiv(vⱼ.link, η[idx]) 
         r[idx] = (y[i] - μ[idx]) / dμdη
-        d[idx] = zweight * dμdη^2 / stable_glmvar(vⱼ.family, μ[idx], η[idx])
-        # if isnan(d[idx]) || isinf(d[idx]) || isnan(r[idx]) || isinf(r[idx])
-        #   error("Encountered underflow/overflow. Check arrays!")
-        # end
+        d[idx] = zweight * stable_irls_weight(vⱼ.family, vⱼ.link, η[idx], μ[idx], dμdη)
         idx += 1
       end
 
@@ -123,12 +124,7 @@ function mm_update!(penalty, vⱼ, vmod, tobs, workspace, caches)
     end
 
     accumulate_penalty_derivs!(penalty, ∇L, ∇²L, vⱼ.rho, β, w, Γ)
-    # gg = ForwardDiff.gradient(b -> eval_surrogate(b, vⱼ.index, Γ, w, rho, vmod, tobs, penalty), β)
-    # hh = ForwardDiff.hessian(b -> -eval_surrogate(b, vⱼ.index, Γ, w, rho, vmod, tobs, penalty), β)
-    # @show norm(gg - ∇L)
-    # @show norm(Symmetric(hh, :U) - Symmetric(∇²L, :U))
-    ldiv!(search_direction, cholesky!(Symmetric(∇²L, :U)), ∇L)
-    # ldiv!(search_direction, cholesky!(Symmetric(hh, :U)), ∇L)
-    # @. vⱼ.beta_new = β + search_direction
+    H = Symmetric(∇²L, :U)
+    ldiv!(search_direction, cholesky!(H), ∇L)
   end
 end

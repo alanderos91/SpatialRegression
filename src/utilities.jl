@@ -64,11 +64,11 @@ is_inside_mesh(Δ::Triangulation) = Base.Fix1(is_inside_mesh, Δ)
 #
 function linesearch!(βₙ₊₁, βₙ, Δ, iter, objective, backtrack, index, gamma, weights, rho, vmod, tobs, penalty, caches)
   # Backtracking line search
-  t = 10.0
+  t = 1.0
   for step in 0:backtrack
     @. βₙ₊₁ = βₙ + t * Δ
     objective_new = eval_surrogate(βₙ₊₁, index, gamma, weights, rho, vmod, tobs, penalty, caches)
-    if objective_new >= objective + objective_new * 1e-6
+    if (objective_new >= objective + objective_new * 1e-6) || isapprox(objective_new, objective, atol = sqrt(eps()))
       break
     elseif step < backtrack
       t /= 2
@@ -79,14 +79,13 @@ function linesearch!(βₙ₊₁, βₙ, Δ, iter, objective, backtrack, index, 
       break
     end
   end
-  return t, step
+  return t
 end
 #
 # LOG-LIKELIHOOD
 #
 function eval_and_cache_loglikelihoods!(caches, v::VertexModel, tobs)
-  i_start = 1
-  j, β, η = v.index, v.beta, v.eta
+  j, β, η, μ = v.index, v.beta, v.eta, v.mu
   family, link = v.family, v.link
   i_start = 1
   for triidx in v.triangles
@@ -94,12 +93,13 @@ function eval_and_cache_loglikelihoods!(caches, v::VertexModel, tobs)
     y, X = T.y, T.X
     t = get_triangle_vertices(T, j)
     n = length(y)
-    logl = view(caches[triidx], t, :)
+    logl = view(caches.logf[triidx], t, :)
     idxrange = i_start:(i_start+n-1)
     mul!(view(η, idxrange), X, β) # η = Xβ
     for (i, idx) in enumerate(idxrange)
-      μ, _ = GLM.inverselink(link, η[idx])
-      logl[i] = GLM.loglik_obs(family, y[i], μ, 1, 1)
+      μ[idx] = meanfun(link, η[idx])
+      logfᵢ = GLMUtilities.log_likelihood(y[i], μ[idx], η[idx], family, link)
+      logl[i] = logfᵢ
     end
     i_start += n
   end
@@ -150,15 +150,17 @@ function eval_loglikelihoodB(tobs, vmod, penalty_type, caches; nchunks::Int = Th
     OhMyThreads.@set begin
       ntasks = nchunks
       reducer = +
+      outputtype = Float64
     end
     T = tobs[triidx]
     A = T.A
-    cache = caches[triidx]
+    cache = caches.logf[triidx]
     local logl = zero(Float64)
     for i in axes(A, 2)
       a = view(A, :, i)
       logf = view(cache, :, i)
-      logl += stable_logsumexp(a, logf)
+      tmp = stable_logsumexp(a, logf)
+      logl += tmp
     end
     logl
   end

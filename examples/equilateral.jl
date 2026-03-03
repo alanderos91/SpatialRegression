@@ -13,12 +13,11 @@ Main functions:
 """
 module Equilateral
 
-using LinearAlgebra, Random, Statistics, Distributions
+using LinearAlgebra, Random, Statistics, Distributions, GLM
 using DelaunayTriangulation
 using SpatialRegression
 using CairoMakie
 using DataFrames, PrettyTables
-using SpatialRegression.GLM
 using SpatialRegression: L2Squared, L1Approx
 
 function equilateral_refinement(Δ, max_area)
@@ -30,16 +29,16 @@ end
 
 function create_component(family::Normal, link, η)
   σ = scale(family)
-  μ = GLM.linkinv(link, η)
+  μ = SpatialRegression.meanfun(link, η)
   return Normal(μ, σ)
 end
 
 function create_component(::Binomial, link, η)
-  return Bernoulli(GLM.linkinv(link, η))
+  return Bernoulli(SpatialRegression.meanfun(link, η))
 end
 
 function create_component(::Poisson, link, η)
-  return Poisson(GLM.linkinv(link, η))
+  return Poisson(SpatialRegression.meanfun(link, η))
 end
 
 function simulate_data(n, p, Δ, family, link)

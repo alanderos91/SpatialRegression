@@ -2,19 +2,14 @@ module SpatialRegression
 
 using LinearAlgebra
 using StaticArrays
-using Distributions
 using ForwardDiff
 using DelaunayTriangulation
 using OhMyThreads
 
-import Distributions: loglikelihood
-
-import GLM
-using GLM: GlmResp, Link, CauchitLink, CloglogLink,
-  IdentityLink, InverseLink, InverseSquareLink,
-  LogitLink, LogLink, NegativeBinomialLink,
-  PowerLink, ProbitLink, SqrtLink,
-  canonicallink
+# Isolate Distributions + GLM code in separate module.
+# Any required imports are handled in the module and available here.
+include("GLMUtilities.jl")
+using .GLMUtilities
 
 include("TriangleObs.jl")
 include("VertexModel.jl")
@@ -26,36 +21,6 @@ include("stable.jl")
 include("penalty.jl")
 include("mm_update.jl")
 
-function eval_loglikelihoods(v, y, x)
-  return (  # TODO: Make this use BLAS; i.e. η₁, η₂, η₃ = Bᵀx with Bᵀ 3 × p
-    loglik_obs(v[1], y, x),
-    loglik_obs(v[2], y, x),
-    loglik_obs(v[3], y, x)
-  )
-end
-
-function eval_loglikelihood(tobs, vmod, penalty_type::AbstractPenalty)
-  logl = zero(Float64)
-  for T in tobs
-    A, y, X = T.A, T.y, T.X
-    _, v = get_triangle_vertices(T, T.triangle[1], vmod)
-    for i in eachindex(y)
-      x = view(X, i, :)
-      a = view(A, :, i)
-
-      # evaluate log-likelihood at each vertex
-      logf = eval_loglikelihoods(v, y[i], x)
-      
-      # shift log(∑ⱼ αⱼ exp(fⱼ)) by the most negative log-likelihood
-      logl += stable_logsumexp(a, logf)
-    end
-  end
-
-  penalty = eval_penalty(penalty_type, vmod)
-
-  return logl + penalty
-end
-
 function initialize_coefficients!(tobs, vmod)
   for v in vmod
     initialize_coefficients!(v, tobs, vmod)
@@ -63,32 +28,7 @@ function initialize_coefficients!(tobs, vmod)
 end
 
 function initialize_coefficients!(v::VertexModel, tobs, vmod)
-  p = length(v.beta)
-  ∇L, ∇²L = zeros(p), zeros(p, p)
-  i_start = 1
-  for triidx in v.triangles
-    T = tobs[triidx]
-    y, X = T.y, T.X
-    n = length(y)
-    idxrange = i_start:(i_start+n-1)
-    for (i, idx) in enumerate(idxrange)
-      v.mu[idx] = GLM.mustart(v.family, y[i], one(Float64))
-      v.eta[idx] = GLM.linkfun(v.link, v.mu[idx])
-      v.mu[idx], dμdη = GLM.inverselink(v.link, v.eta[idx])
-      v.workres[idx] = (y[i] - v.mu[idx]) / dμdη
-      v.d[idx] = dμdη^2 / stable_glmvar(v.family, v.mu[idx], v.eta[idx])
-    end
-    dd = view(v.d, idxrange)
-    rr = view(v.workres, idxrange)
-    @inbounds for k in axes(X, 1)
-      xx = view(X, k, :)
-      BLAS.axpy!(dd[k] * rr[k], xx, ∇L)
-      BLAS.syr!('U', dd[k], xx, ∇²L)
-    end
-    i_start += n
-  end
-  ldiv!(v.beta, cholesky!(Symmetric(∇²L, :U)), ∇L)
-  return nothing
+  # TODO: Local GLM init leads to poor numerical behavior downstream.
 end
 
 function fitmodel(yfull, Xfull, Sfull, tri;
@@ -96,7 +36,7 @@ function fitmodel(yfull, Xfull, Sfull, tri;
     backtrack::Int = 5,
     tol::Real = 1e-3,
     family::UnivariateDistribution = Normal(),
-    link::Link = GLM.canonicallink(family),
+    link::Link = canonicallink(family),
     rho::Real = 1.0,
     penalty::PT = L2Squared(),
     nchunks::Int = Threads.nthreads(),
@@ -107,7 +47,9 @@ function fitmodel(yfull, Xfull, Sfull, tri;
   tobs = create_triobs_sets(yfull, Xfull, Sfull, tri; nchunks = 4*nchunks)
   vmod = create_vertexmodel_set(family, link, tri, tobs, nvars; rho = rho)
   # initialize_coefficients!(tobs, vmod)
-  logf_cache = Dict(triidx => zeros(3, length(T.y)) for (triidx, T) in enumerate(tobs))
+  logf_cache = (;
+    logf = Dict(triidx => zeros(3, length(T.y)) for (triidx, T) in enumerate(tobs)),
+  )
   logl = eval_loglikelihoodB(tobs, vmod, penalty, logf_cache; nchunks = nchunks)
   logl_prev = zero(logl)
 
@@ -137,6 +79,7 @@ function fitmodel(yfull, Xfull, Sfull, tri;
               if isinf(objective) || isnan(objective)
                 println("Vertex ", vⱼ.index, " Iteration ", iter)
                 display(vⱼ.beta)
+                error("Encountered unstable objective value $(objective) at iteration $(iter).")
               end
               mm_update!(penalty, vⱼ, vmod, tobs, (∇L, ∇²L, search_direction), logf_cache)
               linesearch!(
@@ -164,14 +107,6 @@ function fitmodel(yfull, Xfull, Sfull, tri;
     # Evaluate log-likelihood
     logl_prev = logl
     logl = eval_loglikelihoodB(tobs, vmod, penalty, logf_cache; nchunks = nchunks)
-    # if logl < logl_prev
-    #   rel = abs(logl - logl_prev) / (1 + abs(logl_prev))
-    #   @show iter, logl, logl_prev, rel
-    #   @warn "Detected increase in log-likelihood, likely due to instability in evaluating it at current estimate."
-    #   break
-    # end
-    # rel = abs(logl - logl_prev) / (1 + abs(logl_prev))
-    # @show iter, logl, logl_prev, rel
   end
   return iter, tobs, vmod, logl
 end
@@ -189,9 +124,9 @@ function predict(X, S, vmod, tri)
     v, u, w = vmod[j], vmod[k], vmod[l]
     a, b, c = barycentric(s, [p[1] q[1] r[1]; p[2] q[2] r[2]])
     yhat[i] = 
-      a*GLM.linkinv(v.link, dot(x, v.beta)) +
-      b*GLM.linkinv(u.link, dot(x, u.beta)) +
-      c*GLM.linkinv(w.link, dot(x, w.beta))
+      a*GLMUtilities.meanfun(v.link, dot(x, v.beta)) +
+      b*GLMUtilities.meanfun(u.link, dot(x, u.beta)) +
+      c*GLMUtilities.meanfun(w.link, dot(x, w.beta))
   end
   return yhat
 end

@@ -69,14 +69,3 @@ function create_vertexmodel_set(family::D, link::L, tri::Triangulation, tobs::Ve
 
   return mv
 end
-
-function loglik_obs(v::VertexModel, y, x)
-  loglik_obs(v.beta, y, x, v.family, v.link)
-end
-
-function loglik_obs(beta, y, x, family, link)
-  η = dot(x, beta)
-  μ, _ = GLM.inverselink(link, η)
-  logl = GLM.loglik_obs(family, y, μ, 1, 1)
-  return logl
-end
