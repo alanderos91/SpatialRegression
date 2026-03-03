@@ -67,9 +67,9 @@ export meanfun, linpred
 #
 meanderiv(::IdentityLink, eta) = one(eta)
 meanderiv(::LogitLink, eta) = begin
-  expabs = exp(-abs(eta))
-  opexpabs = 1 + expabs
-  (expabs / opexpabs) / opexpabs
+  CUTOFF = abs(log(eps(typeof(eta))))
+  eta = clamp(eta, -CUTOFF, CUTOFF)
+  return inv(2 * cosh(eta/2))^2
 end
 meanderiv(::LogLink, eta) = exp(eta)
 

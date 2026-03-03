@@ -1,3 +1,18 @@
+import Pkg
+Pkg.activate(".")
+
+"""
+Benchmarks for 2019 HMDA data; CONUS only.
+
+Main functions:
+
+- `plot_meshes()`: Plot meshes used in the benchmarks.
+- `get_meshes()`: Retrieve meshes used in the benchmarks.
+- `run_yu2025()`: Run benchmarks. Uses model due to Yu, Wang, and Wang (2025).
+
+"""
+module HMDA
+
 using DataFrames, CSV, Arrow, ZipFile, PrettyTables
 using Tables, TableOperations
 using CategoricalArrays
@@ -5,11 +20,11 @@ using LibGEOS, Shapefile
 import GeometryOps as GO
 import ArchGDAL as AD
 
-using LinearAlgebra, Random, Statistics, StatsBase, StatsModels, Distributions
+using LinearAlgebra, Random, Statistics, StatsBase, StatsModels, Distributions, GLM
 using DelaunayTriangulation
 using SpatialRegression
 using CairoMakie
-using SpatialRegression.GLM
+using SpatialRegression: L2Squared, L1Approx
 
 const INCLUDED_AGE_LEVELS = ["<25", "25-34", "35-44", "45-54", "55-64", "65-74", ">74"]
 const EXCLUDED_DTI_VALUES = ["Exempt", "NA"]
@@ -230,6 +245,26 @@ function load_conus_triangulation(filepath)
   return tri
 end
 
+function get_meshes()
+  return (
+    load_conus_triangulation(joinpath("USBoundary_tol=0.5.csv")),
+    load_conus_triangulation(joinpath("USBoundary_tol=0.1.csv")),
+    load_conus_triangulation(joinpath("USBoundary_tol=0.01.csv"))
+  )
+end
+
+function plot_meshes()
+  Δs = get_meshes()
+  figtri = Figure(size = (400*length(Δs), 400));
+  for (j, Δ) in enumerate(Δs)
+    ax = Axis(figtri[1,j], title = get_tri_title(Δ))
+    triplot!(ax, Δ)
+  end
+  figtri
+  save(joinpath("figures", "HMDA-Meshes.pdf"), figtri)
+  return nothing
+end
+
 function is_inside_mesh(Δ::Triangulation, s)
   triangle = find_triangle(Δ, s, concavity_protection = true)
  return all(>(0), triangle)
@@ -237,37 +272,56 @@ end
 
 is_inside_mesh(Δ::Triangulation) = Base.Fix1(is_inside_mesh, Δ)
 
-function run_benchmark(; seed = 1903, sample_pct = 0.1)
-  Random.seed!(seed)
-
-  # Load triangulations
-  Δs = (
-    load_conus_triangulation(joinpath("USBoundary_tol=0.5.csv")),
-    load_conus_triangulation(joinpath("USBoundary_tol=0.1.csv")),
-    load_conus_triangulation(joinpath("USBoundary_tol=0.01.csv"))
-  );
-
-  # Load data and drop cases with dubious values
-  tbl_full = Arrow.Table(joinpath("data", "hmda2019_clean.arrow")) |> DataFrame
-  tbl_full = filter(row -> row.Income > 0 && row.DTI > 0 && row.Tpop > 0 && row.Tincome > 0 && row.Mincome > 0, tbl_full)
-  
-  # Sample the data to get down to a more manageable size
-  n_full = nrow(tbl_full)
-  n_sample = round(Int, n_full * sample_pct)
-  mask = zeros(Bool, n_full)
-  mask[1:n_sample] .= 1
-  shuffle!(mask)
-  tbl = tbl_full[mask, :]
-
-  # Build model from DataFrame. Categorical variables saved as CategoricalVector.
-  formula = @formula(0 ~
+function formula_yu2025()
+  return @formula(0 ~
     LoanTerm + LoanType +
     Ethnicity + Race + Sex + Age +
     log(Income) + log(DTI) + log(Tpop) + 
     Tminority + log(Tincome) + log(Mincome)
   )
+end
+
+function get_modelmatrix(tbl)
+  formula = formula_yu2025()
   mf = ModelFrame(formula, tbl)
-  mm = ModelMatrix(mf)
+  return ModelMatrix(mf)
+end
+
+function load_data()
+  tbl_full = Arrow.Table(joinpath("data", "hmda2019_clean.arrow")) |> DataFrame
+  tbl_full = filter(row -> row.Income > 0 && row.DTI > 0 && row.Tpop > 0 && row.Tincome > 0 && row.Mincome > 0, tbl_full)
+  return tbl_full
+end
+
+function get_subsample(tbl_full, sample_pct)
+  n_full = nrow(tbl_full)
+  n_sample = round(Int, n_full * sample_pct)
+  mask = zeros(Bool, n_full)
+  mask[1:n_sample] .= 1
+  shuffle!(mask)
+  return tbl_full[mask, :]
+end
+
+function run_benchmark(rho, penalty; seed = 1903, sample_pct = 0.1)
+  Random.seed!(seed)
+  penalty_names = Dict(
+    L2Squared => "Ridge",
+    L1Approx => "L1Smooth",
+  )
+  penalty_name = penalty_names[typeof(penalty)]
+  tol = 1e-5
+
+  # Load triangulations
+  Δs = get_meshes()
+
+  # Load data and drop cases with dubious values
+  tbl_full = load_data()
+  
+  # Sample the data to get down to a more manageable size
+  tbl = get_subsample(tbl_full, sample_pct)
+
+  # Build model from DataFrame. Categorical variables saved as CategoricalVector.
+  mm = get_modelmatrix(tbl)
 
   # Build response, model matrix, and spatial matrix
   X_sample = mm.m
@@ -281,19 +335,31 @@ function run_benchmark(; seed = 1903, sample_pct = 0.1)
     y, X, S = y_sample[idx], X_sample[idx, :], S_sample[:, idx]
 
     # Run the benchmark
+    @timed SpatialRegression.fitmodel(y, X, S, Δ;
+      family = Binomial(),
+      link = LogitLink(),
+      rho = rho,
+      tol = tol,
+      backtrack = 100,
+      maxiter = 10,
+      penalty = penalty,
+      nchunks = Threads.nthreads()
+    )
+
     timed_result = @timed SpatialRegression.fitmodel(y, X, S, Δ;
       family = Binomial(),
       link = LogitLink(),
-      rho = 1.0,
-      tol = 1e-6,
+      rho = rho,
+      tol = tol,
       backtrack = 100,
-      maxiter = 10^4
+      maxiter = 10^4,
+      penalty = penalty,
+      nchunks = Threads.nthreads()
     )
 
     # Make predictions and check how we did.
     n, p = sum(idx), size(X, 2) - 1
-    niter, tobs, vmod = timed_result.value
-    logl = SpatialRegression.eval_loglikelihood(tobs, vmod)
+    niter, tobs, vmod, logl = timed_result.value
     timing = timed_result.time
     yhat = SpatialRegression.predict(X, S, vmod, Δ)
     rmse_resp = sqrt(mean(abs2, y - yhat))
@@ -304,7 +370,8 @@ function run_benchmark(; seed = 1903, sample_pct = 0.1)
       location = S,
       triangulation = Δ,
       prediction = yhat,
-      niter, logl, timing, rmse_resp
+      niter, logl, timing, rmse_resp,
+      penalty = penalty_name
     )
     push!(results, result)
   end
@@ -320,7 +387,7 @@ function get_tri_title(Δ)
   return "$(stats.num_solid_triangles) triangles, $(stats.num_solid_vertices) vertices"
 end
 
-function plot_compare_fitted(instances; markersize = 4.0, kwargs...)
+function plot_fitted(instances; markersize = 4.0, kwargs...)
   local W = 400; H = 250
   local NROW = 2; NSCENARIO = length(instances)
 
@@ -358,30 +425,39 @@ function plot_compare_fitted(instances; markersize = 4.0, kwargs...)
   return fig
 end
 
-results = run_benchmark(; sample_pct = 0.1, seed = 1903)
-plot_compare_fitted(results; markersize = 4)
-
-save("USLoans_n=10pct.pdf", current_figure())
-
-tbl = DataFrame()
-
-for r in results
-  stats = statistics(r.triangulation)
-  push!(
-    tbl,
-    (;
-      triangles = stats.num_solid_triangles,
-      vertices = stats.num_solid_vertices,
-      n = r.cases,
-      p = r.features,
-      time = r.timing / 60,   # record in minutes
-      niters = r.niter,
-      logl = r.logl,
-      rmse_resp = r.rmse_resp,
-    )
+function run_yu2025()
+  penalty_names = Dict(
+    L2Squared => "Ridge",
+    L1Approx => "L1Smooth",
   )
-end
+  for penalty in (L2Squared(), L1Approx(sqrt(1e-8)))
+    results = run_benchmark(1.0, penalty; sample_pct = 0.1, seed = 1903)
+    penalty_name = penalty_names[typeof(penalty)]
+    plot_fitted(results; markersize = 4)
+    save(joinpath("figures", "HMDA-n=10pct-$(penalty_name).pdf"), current_figure())
 
-open("USLoans_n=10pct.txt", "w") do io
-  pretty_table(io, tbl; backend = :latex)
+    tbl = DataFrame()
+    for r in results
+      stats = statistics(r.triangulation)
+      push!(
+        tbl,
+        (;
+          triangles = stats.num_solid_triangles,
+          vertices = stats.num_solid_vertices,
+          n = r.cases,
+          p = r.features,
+          penalty = r.penalty,
+          time = r.timing / 60,   # record in minutes
+          niters = r.niter,
+          logl = r.logl,
+          rmse_resp = r.rmse_resp,
+        )
+      )
+    end
+
+    open(joinpath("tables", "HMDA-n=10pct-$(penalty_name).txt"), "w") do io
+      pretty_table(io, tbl; backend = :latex)
+    end
+  end
 end
+end # module
