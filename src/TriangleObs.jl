@@ -1,5 +1,18 @@
+"""
+    TriangleObs(triangle, idx, y, X, S, A, V)
+
+Represents a collection of observations, `(y, X, S)`, that lie within a `triangle`.
+
+Users should create `TriangleObs` instances using `create_triangle_obs()` instead of
+invoking this type's constructors directly.
+
+The following invariants hold for instances of `TriangleObs`:
+
+- `triangle` is a tuple `(j,k,l)` of vertex indices in ascending order (`j < k < l`).
+- `idx` contains indices into the parent arrays of `(y, X, S)`.
+"""
 struct TriangleObs
-  triangle::Tuple{Int,Int,Int} # indices in ascending order
+  triangle::Tuple{Int,Int,Int} # vertex indices (j,k,l) in ascending order
   idx::Vector{Int}    # set of indices into original data (y, X)
   y::Vector{Float64}  # response local to triangle
   X::Matrix{Float64}  # covariates local to triangle, stored in rows
@@ -8,7 +21,26 @@ struct TriangleObs
   V::Matrix{Float64}  # vertices of triangle, stored in columns
 end
 
-function create_triobs_sets(y, X, S, tri; nchunks::Int = Threads.nthreads())
+"""
+    create_triobs_sets(y, X, S, tri::Triangulation; nchunks::Int = Threads.nthreads())
+
+Create a `Vector` of `TriangleObs` instances from the spatial data `(y, X, S)` over mesh `tri`.
+
+This effectively assigns each observation to a unique triangle within triangulation `tri`.
+
+# Arguments
+
+- `y`: The dependent variable or response, given as an `n` by `1` vector-like object.
+- `X`: The independent variables or predictors, given as an `n` by `p` matrix-like object.
+- `S`: The spatial (Cartesian) coordinates for each observation, given as an `2` by `n` matrix-like object.
+- `tri`: A `Triangulation` implementing a mesh for a spatial domain.
+ 
+# Optional
+
+- `nchunks`: The number of parallel tasks to use in assigning each observation to a triangle.
+  The default references the result of `Threads.nthreads()`.
+"""
+function create_triobs_sets(y, X, S, tri::Triangulation; nchunks::Int = Threads.nthreads())
   # Get points + mapping to solid vertices.
   # The mapping is needed to ensure vertex label = index into some array
   vertex = get_points(tri)
@@ -22,36 +54,11 @@ function create_triobs_sets(y, X, S, tri; nchunks::Int = Threads.nthreads())
   end
 
   # Assign each observation to a triangle in parallel
-  TriType = Tuple{Int,Int,Int}
-  IdxType = Vector{Int}
-  itr = OhMyThreads.ChannelLike(axes(S, 2))
-  tmp = OhMyThreads.@localize tri id2vertex itr OhMyThreads.tmap(Dict{TriType,IdxType}, 1:nchunks; chunking = false) do _
-    local dict = Dict{TriType,IdxType}()
-    map(itr) do i
-      if iszero(i)
-        triidx = (0, 0, 0)
-      else
-        s = view(S, :, i)
-        j, k, l = find_triangle(tri, s, concavity_protection = true)
-        triidx = sort((id2vertex[j], id2vertex[k], id2vertex[l]))
-      end
-      if !haskey(dict, triidx)
-        dict[triidx] = Int[]
-      end
-      push!(dict[triidx], i)
-      return nothing
-    end
-    return dict
-  end
-  
-  # Aggregate results across tasks
-  dict = Dict{TriType,IdxType}()
-  mergewith!(union!, dict, tmp...)
-  n_active = length(keys(dict))
+  nonempty_triangles, tri2idx = _assign_data_to_triangles(tri, id2vertex, S, nchunks)
 
   # Create TriangleObs for each 'active' triangle
-  triobs = Vector{TriangleObs}(undef, n_active)
-  for (i, (triidx, idx)) in enumerate(dict)
+  triobs = Vector{TriangleObs}(undef, nonempty_triangles)
+  for (i, (triidx, idx)) in enumerate(tri2idx)
     sort!(idx) # mitigate random access patterns as much as possible
     Vₜ = V[:, [triidx[1], triidx[2], triidx[3]]]
     Sₜ = S[:, idx]
@@ -62,21 +69,56 @@ function create_triobs_sets(y, X, S, tri; nchunks::Int = Threads.nthreads())
   return triobs
 end
 
+function _assign_data_to_triangles(tri, id2vertex, S, nchunks)
+  TriType = Tuple{Int,Int,Int}
+  IdxType = Vector{Int}
+  cases = OhMyThreads.ChannelLike(axes(S, 2))
+
+  # Build mapping in parallel; don't care about sorting keys or indices yet.
+  tmp = OhMyThreads.@localize tri id2vertex cases OhMyThreads.tmap(Dict{TriType,IdxType}, 1:nchunks; chunking = false) do _
+    local tri2idx = Dict{TriType,IdxType}()
+    for i in cases
+      # Check whether i-th case lies inside any triangle of the mesh
+      if iszero(i)
+        triidx = (0, 0, 0)
+      else
+        s = view(S, :, i)
+        j, k, l = find_triangle(tri, s, concavity_protection = true)
+        triidx = sort((id2vertex[j], id2vertex[k], id2vertex[l]))
+      end
+
+      # Associate index i to triangle key (j,k,l)
+      if !haskey(tri2idx, triidx)
+        tri2idx[triidx] = Int[]
+      end
+      push!(tri2idx[triidx], i)
+    end
+    return tri2idx
+  end
+  
+  # Aggregate results across tasks
+  tri2idx = Dict{TriType,IdxType}()
+  mergewith!(union!, tri2idx, tmp...)
+  nonempty_triangles = length(keys(tri2idx))
+
+  return nonempty_triangles, tri2idx
+end
+
 """
-    get_triangle_vertices(T::TriangleObs, index, vmod)
+    get_triangle_vertices(Tobs::TriangleObs, index, vmod)
 
 Match `index` to one of `(j, k, l)` and retrieve the vertices `(vⱼ, vₖ, vₗ)`.
 
 Returns `pos` as one of `1`, `2`, or `3` along with a tuple of vertices.
 """
-function get_triangle_vertices(T::TriangleObs, index, vmod)
-  j, k, l = T.triangle
-  pos = get_triangle_vertices(T, index)
+function get_triangle_vertices(Tobs::TriangleObs, index, vmod)
+  j, k, l = Tobs.triangle
+  pos = get_triangle_vertices(Tobs, index)
   return pos, (vmod[j], vmod[k], vmod[l])
 end
 
-function get_triangle_vertices(T::TriangleObs, index)
-  j, k, l = T.triangle
+function get_triangle_vertices(Tobs::TriangleObs, index)
+  j, k, l = Tobs.triangle
   if index == j
     pos = 1
   elseif index == k
@@ -84,7 +126,7 @@ function get_triangle_vertices(T::TriangleObs, index)
   elseif index == l
     pos = 3
   else
-    error("The index $(index) is not in the triangle $(T.triangle).")
+    error("The index $(index) is not in the triangle $(Tobs.triangle).")
   end
   return pos
 end
