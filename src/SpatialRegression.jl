@@ -11,10 +11,11 @@ using OhMyThreads
 include("GLMUtilities.jl")
 using .GLMUtilities
 
+abstract type AbstractVertexModel end
 include("TriangleObs.jl")
-include("VertexModel.jl")
+include("VertexGLM.jl")
 export TriangleObs, create_triobs_sets,
-  VertexModel, create_vertexmodel_set
+  VertexGLM, create_vertexmodel_set
 
 include("utilities.jl")
 include("stable.jl")
@@ -27,7 +28,7 @@ function initialize_coefficients!(tobs, vmod)
   end
 end
 
-function initialize_coefficients!(v::VertexModel, tobs, vmod)
+function initialize_coefficients!(v::VertexGLM, tobs, vmod)
   # TODO: Local GLM init leads to poor numerical behavior downstream.
 end
 

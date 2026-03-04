@@ -84,24 +84,21 @@ end
 #
 # LOG-LIKELIHOOD
 #
-function eval_and_cache_loglikelihoods!(caches, v::VertexModel, tobs)
+function eval_and_cache_loglikelihoods!(caches, v::VertexGLM, tobs)
   j, β, η, μ = v.index, v.beta, v.eta, v.mu
   family, link = v.family, v.link
-  i_start = 1
-  for triidx in v.triangles
+
+  for (triidx, idxrange) in zip(v.triangles, v.part)
     T = tobs[triidx]
     y, X = T.y, T.X
     t = get_triangle_vertices(T, j)
-    n = length(y)
     logl = view(caches.logf[triidx], t, :)
-    idxrange = i_start:(i_start+n-1)
     mul!(view(η, idxrange), X, β) # η = Xβ
-    for (i, idx) in enumerate(idxrange)
+    @inbounds for (i, idx) in zip(eachindex(logl, y), idxrange)
       μ[idx] = meanfun(link, η[idx])
       logfᵢ = GLMUtilities.log_likelihood(y[i], μ[idx], η[idx], family, link)
       logl[i] = logfᵢ
     end
-    i_start += n
   end
   return caches
 end
