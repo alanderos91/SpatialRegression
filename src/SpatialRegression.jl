@@ -4,23 +4,36 @@ using LinearAlgebra
 using StaticArrays
 using ForwardDiff
 using DelaunayTriangulation
-using OhMyThreads
+using OhMyThreads: @localize, @tasks, @set, tmap, tforeach, ChannelLike
+using ChunkSplitters
+
+# Imports for writing custom chunkable iterators
+import Base:
+  iterate, length, eltype,
+  firstindex, lastindex,
+  view
+
+import ChunkSplitters: is_chunkable
 
 # Isolate Distributions + GLM code in separate module.
 # Any required imports are handled in the module and available here.
 include("GLMUtilities.jl")
+include("utilities.jl")
 using .GLMUtilities
 
 abstract type AbstractVertexModel end
+abstract type AbstractPenalty end
+abstract type AbstractSpatialModel end
 include("TriangleObs.jl")
+include("SpatialVertexModel.jl")
 include("VertexGLM.jl")
-export TriangleObs, create_triobs_sets,
-  VertexGLM, create_vertexmodel_set
+export TriangleObs,
+  VertexGLM,
+  SpatialVertexModel
 
-include("utilities.jl")
 include("stable.jl")
 include("penalty.jl")
-include("mm_update.jl")
+export L2Squared, L1Approx
 
 function initialize_coefficients!(tobs, vmod)
   for v in vmod
@@ -32,84 +45,55 @@ function initialize_coefficients!(v::VertexGLM, tobs, vmod)
   # TODO: Local GLM init leads to poor numerical behavior downstream.
 end
 
-function fitmodel(yfull, Xfull, Sfull, tri;
+function fitmodel(::Type{V}, yfull, Xfull, Sfull, tri;
     maxiter::Int = 100,
     backtrack::Int = 5,
     tol::Real = 1e-3,
-    family::UnivariateDistribution = Normal(),
-    link::Link = canonicallink(family),
     rho::Real = 1.0,
-    penalty::PT = L2Squared(),
     nchunks::Int = Threads.nthreads(),
+    kwargs...
     # intercept = all(isequal(1), view(Xfull, :, 1)),
-  ) where PT <: AbstractPenalty
+  ) where V <: AbstractVertexModel
   # Initialize
   nvars = size(Xfull, 2)
-  tobs = create_triobs_sets(yfull, Xfull, Sfull, tri; nchunks = 4*nchunks)
-  vmod = create_vertexmodel_set(family, link, tri, tobs, nvars; rho = rho)
-  # initialize_coefficients!(tobs, vmod)
-  logf_cache = (;
-    logf = Dict(triidx => zeros(3, length(T.y)) for (triidx, T) in enumerate(tobs)),
-  )
-  logl = eval_loglikelihoodB(tobs, vmod, penalty, logf_cache; nchunks = nchunks)
-  logl_prev = zero(logl)
-
-  BLAS_THREADS = BLAS.get_num_threads()
-  cache = [(zeros(nvars), zeros(nvars, nvars), zeros(nvars)) for _ in 1:nchunks]
-
+  model = f = create_model(V, yfull, Xfull, Sfull, tri; nchunks, kwargs...)
+  update_caches!(model; nchunks)
+  nlogl = f(rho; nchunks)
+  nlogl_prev = zero(nlogl)
   iter = 0
-  while iter < maxiter && abs(logl - logl_prev) > (1 + abs(logl_prev)) * tol
+  while iter < maxiter && abs(nlogl - nlogl_prev) > (1 + abs(nlogl_prev)) * tol
     iter += 1
 
-    # Update local averaged estimates, γₙⱼₖ
-    eval_gamma!(vmod)
-
     # Visit each vertex once to update local parameters
-    workspace = OhMyThreads.ChannelLike(cache)
-    workitr = OhMyThreads.ChannelLike(vmod)
-    try
-      BLAS.set_num_threads(max(1, div(BLAS_THREADS, nchunks)))
-      OhMyThreads.@localize iter tobs vmod nvars OhMyThreads.tforeach(1:nchunks; chunking = false) do _
-        map(workspace) do (∇L, ∇²L, search_direction)
+    workspace = ChannelLike(model.caches.workspace)
+    workitr = ChannelLike(eachvertex(model))
 
-          map(workitr) do vⱼ
-            if isempty(vⱼ.triangles)
-              update_empty_case!(penalty, vⱼ, vⱼ.weights, vⱼ.gamma)
+    @safe_blas begin
+      @localize iter model rho backtrack tforeach(1:nchunks; chunking = false) do _
+        map(workspace) do wrk
+          for v in workitr
+            g = VertexSurrogate(v.index, model, rho)
+            if isempty(v.triangles)
+              update_empty_case!(model.penalty, v, v.weights, model.caches)
             else
-              objective = eval_surrogate(vⱼ.beta, vⱼ.index, vⱼ.gamma, vⱼ.weights, vⱼ.rho, vmod, tobs, penalty, logf_cache)
-              if isinf(objective) || isnan(objective)
-                println("Vertex ", vⱼ.index, " Iteration ", iter)
-                display(vⱼ.beta)
-                error("Encountered unstable objective value $(objective) at iteration $(iter).")
-              end
-              mm_update!(penalty, vⱼ, vmod, tobs, (∇L, ∇²L, search_direction), logf_cache)
-              linesearch!(
-                vⱼ.beta_new,
-                vⱼ.beta,
-                search_direction,
-                iter,
-                objective,
-                backtrack,
-                vⱼ.index, vⱼ.gamma, vⱼ.weights, vⱼ.rho, vmod, tobs, penalty, logf_cache
-              )
+              mm_update!(model.penalty, g, v, model.triobs, wrk, model.caches, backtrack)
             end
           end
         end
       end
-    finally
-      BLAS.set_num_threads(BLAS_THREADS)
-    end
+    end nchunks=nchunks
 
     # Apply all updates
-    for vⱼ in vmod
-      @. vⱼ.beta = vⱼ.beta_new
+    for v in eachvertex(model)
+      @. v.beta = v.beta_new
     end
 
     # Evaluate log-likelihood
-    logl_prev = logl
-    logl = eval_loglikelihoodB(tobs, vmod, penalty, logf_cache; nchunks = nchunks)
+    update_caches!(model; nchunks)
+    nlogl_prev = nlogl
+    nlogl = f(rho; nchunks)
   end
-  return iter, tobs, vmod, logl
+  return iter, model, nlogl
 end
 
 function predict(X, S, vmod, tri)

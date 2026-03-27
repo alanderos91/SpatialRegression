@@ -1,5 +1,3 @@
-abstract type AbstractPenalty end
-
 struct L2Squared <: AbstractPenalty end
 struct L1Approx <: AbstractPenalty epsilon::Float64 end
 
@@ -12,7 +10,7 @@ function eval_penalty(::L2Squared, vmod)
       @inbounds @simd for j in eachindex(v.beta)
         diff += abs2(v.beta[j] - u.beta[j])
       end
-      penalty -= v.rho/4 * v.weights[idx] * diff
+      penalty += 1//4 * v.weights[idx] * diff
     end
   end
   return penalty
@@ -32,26 +30,25 @@ function eval_penalty(p::L1Approx, vmod)
       @inbounds @simd for j in eachindex(v.beta)
         diff += l1apx(v.beta[j] - u.beta[j], epsilon)
       end
-      penalty -= v.rho/2 * v.weights[idx] * diff
+      penalty += 1//2 * v.weights[idx] * diff
     end
   end
   return penalty
 end
 
-
-function eval_penalty_surrogate(::L2Squared, rho, beta, weights, gamma, betan)
+function eval_penalty_surrogate(::L2Squared, beta, weights, gamma, betan)
   penalty = zero(Float64)
   for (idx, γ) in enumerate(eachcol(gamma))
     diff = zero(eltype(beta))
     @inbounds @simd for k in eachindex(beta)
       diff += abs2(beta[k] - γ[k])
     end
-    penalty -= rho * weights[idx] * diff
+    penalty += weights[idx] * diff
   end
   return penalty
 end
 
-function eval_penalty_surrogate(p::L1Approx, rho, beta, weights, gamma, betan)
+function eval_penalty_surrogate(p::L1Approx, beta, weights, gamma, betan)
   epsilon = p.epsilon
   penalty = zero(Float64)
   for (idx, γ) in enumerate(eachcol(gamma))
@@ -61,24 +58,26 @@ function eval_penalty_surrogate(p::L1Approx, rho, beta, weights, gamma, betan)
       q = l1apx(eta, epsilon/2)
       diff += 1 / (2*q) * ((beta[k] - γ[k])^2 - eta^2) + q
     end
-    penalty -= rho * weights[idx] * diff
+    penalty += weights[idx] * diff
   end
   return penalty
 end
 
-function accumulate_penalty_derivs!(::L2Squared, grad, hess, rho, beta, weights, gamma)
+# TODO: Check SIGNS here
+function accumulate_penalty_derivs!(::L2Squared, grad, hess, v, gamma, rho)
+  beta, weights = v.beta, v.weights
   wsum = sum(weights)
   wrho = 2 * rho
-  BLAS.gemm!('N', 'N', wrho, gamma, weights, true, grad)
-  BLAS.axpy!(-wrho*wsum, beta, grad)
-  # grad .= grad - wrho*(sum(w)*beta - gamma*weights)
+  BLAS.gemm!('N', 'N', -wrho, gamma, weights, true, grad)
+  BLAS.axpy!(wrho*wsum, beta, grad)
   @inbounds @simd for k in axes(hess, 2)
     hess[k,k] += wrho*wsum
   end
-  # hess .= hess + wrho*wsum*I
 end
 
-function accumulate_penalty_derivs!(p::L1Approx, grad, hess, rho, beta, weights, gamma)
+# TODO: Check SIGNS here
+function accumulate_penalty_derivs!(p::L1Approx, grad, hess, v, gamma, rho)
+  beta, weights = v.beta, v.weights
   epsilon = p.epsilon
   for k in eachindex(beta)
     c, d = zero(Float64), zero(Float64)
@@ -88,7 +87,32 @@ function accumulate_penalty_derivs!(p::L1Approx, grad, hess, rho, beta, weights,
       c += weights[idx] / q
       d += eta * weights[idx] / q
     end
-    grad[k] -= rho*d
+    grad[k] += rho*d
     hess[k,k] += rho*c
   end
+end
+
+function update_empty_case!(::L2Squared, v, weights, caches)
+  gamma = caches.gamma[v.index]
+  mul!(v.beta_new, gamma, weights)
+  sumw = sum(weights)
+  @. v.beta_new = v.beta_new / sumw
+  return nothing
+end
+
+function update_empty_case!(p::L1Approx, v, weights, caches)
+  gamma = caches.gamma[v.index]
+  epsilon = p.epsilon
+  beta = v.beta
+  for k in eachindex(beta)
+    num, den = zero(Float64), zero(Float64)
+    for (idx, γ) in enumerate(eachcol(gamma))
+      eta = beta[k] - γ[k]
+      q = l1apx(eta, epsilon/2)
+      num += γ[k] * weights[idx] / q
+      den += weights[idx] / q
+    end
+    v.beta_new[k] = num / den
+  end
+  return nothing
 end

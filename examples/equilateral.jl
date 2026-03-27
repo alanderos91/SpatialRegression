@@ -145,10 +145,10 @@ function run_benchmark!(generate_data, results, Δ, family, link, seed, rho, pen
   Random.seed!(seed)
   local y, X, S, B0 = generate_data(Δ)
   BACKTRACK = 100
-  TOL = 1e-5
+  TOL = 1e-6
 
   # Precompile
-  @timed SpatialRegression.fitmodel(y, X, S, Δ;
+  @timed SpatialRegression.fitmodel(VertexGLM, y, X, S, Δ;
     family = family,
     link = link,
     penalty = penalty,
@@ -160,7 +160,7 @@ function run_benchmark!(generate_data, results, Δ, family, link, seed, rho, pen
   )
 
   # Fit a model with our MM algorithm
-  timed_result = @timed SpatialRegression.fitmodel(y, X, S, Δ;
+  timed_result = @timed SpatialRegression.fitmodel(VertexGLM, y, X, S, Δ;
     family = family,
     link = link,
     penalty = penalty,
@@ -173,16 +173,16 @@ function run_benchmark!(generate_data, results, Δ, family, link, seed, rho, pen
 
   # Collect results and write to DataFrame
   stats = statistics(Δ)
-  niter, tobs, vmod, logl = timed_result.value
+  niter, m, logl = timed_result.value
   timing = timed_result.time  
-  B = hcat([v.beta for v in vmod]...)
-  yhat = SpatialRegression.predict(X, S, vmod, Δ)
+  B = hcat([v.beta for v in m.vertex]...)
+  yhat = SpatialRegression.predict(X, S, m.vertex, Δ)
   rmse_beta = sqrt(mean(abs2, B - B0))
   rmse_resp = sqrt(mean(abs2, y - yhat))
   push!(results,
     (
       family |> typeof |> nameof |> string,
-      length(vmod), stats.num_solid_triangles, 
+      length(m.vertex), stats.num_solid_triangles, 
       niter, logl, timing, rmse_beta, rmse_resp
     )
   )
@@ -254,7 +254,7 @@ function run_balanced()
   seed = 1903
   penalties = (
     ("Ridge", L2Squared()),
-    ("L1Smooth", L1Approx(sqrt(1e-8))),
+    ("L1Smooth", L1Approx(sqrt(1e-10))),
   )
 
   for (penalty_name, penalty) in penalties

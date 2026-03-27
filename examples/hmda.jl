@@ -26,6 +26,8 @@ using SpatialRegression
 using CairoMakie
 using SpatialRegression: L2Squared, L1Approx
 
+import JLD2
+
 const INCLUDED_AGE_LEVELS = ["<25", "25-34", "35-44", "45-54", "55-64", "65-74", ">74"]
 const EXCLUDED_DTI_VALUES = ["Exempt", "NA"]
 const INCLUDED_ETHNICITY_LEVELS = ["Not Hispanic or Latino", "Hispanic or Latino"]
@@ -335,7 +337,7 @@ function run_benchmark(rho, penalty; seed = 1903, sample_pct = 0.1)
     y, X, S = y_sample[idx], X_sample[idx, :], S_sample[:, idx]
 
     # Run the benchmark
-    @timed SpatialRegression.fitmodel(y, X, S, Δ;
+    @timed SpatialRegression.fitmodel(VertexGLM, y, X, S, Δ;
       family = Binomial(),
       link = LogitLink(),
       rho = rho,
@@ -346,22 +348,22 @@ function run_benchmark(rho, penalty; seed = 1903, sample_pct = 0.1)
       nchunks = Threads.nthreads()
     )
 
-    timed_result = @timed SpatialRegression.fitmodel(y, X, S, Δ;
+    timed_result = @timed SpatialRegression.fitmodel(VertexGLM, y, X, S, Δ;
       family = Binomial(),
       link = LogitLink(),
       rho = rho,
       tol = tol,
       backtrack = 100,
-      maxiter = 10^4,
+      maxiter = 10^3,
       penalty = penalty,
       nchunks = Threads.nthreads()
     )
 
     # Make predictions and check how we did.
     n, p = sum(idx), size(X, 2) - 1
-    niter, tobs, vmod, logl = timed_result.value
+    niter, m, logl = timed_result.value
     timing = timed_result.time
-    yhat = SpatialRegression.predict(X, S, vmod, Δ)
+    yhat = SpatialRegression.predict(X, S, m.vertex, Δ)
     rmse_resp = sqrt(mean(abs2, y - yhat))
     result = (;
       cases = n,
@@ -371,7 +373,8 @@ function run_benchmark(rho, penalty; seed = 1903, sample_pct = 0.1)
       triangulation = Δ,
       prediction = yhat,
       niter, logl, timing, rmse_resp,
-      penalty = penalty_name
+      penalty = penalty_name,
+      vertex = m.vertex
     )
     push!(results, result)
   end
@@ -430,11 +433,13 @@ function run_yu2025()
     L2Squared => "Ridge",
     L1Approx => "L1Smooth",
   )
-  for penalty in (L2Squared(), L1Approx(sqrt(1e-8)))
-    results = run_benchmark(1.0, penalty; sample_pct = 0.1, seed = 1903)
+  rho = 1e-1
+  for pct in (1, 5, 25, 50), penalty in (L2Squared(), L1Approx(sqrt(1e-10)))
+    results = run_benchmark(rho, penalty; sample_pct = pct/100, seed = 1903)
     penalty_name = penalty_names[typeof(penalty)]
     plot_fitted(results; markersize = 4)
-    save(joinpath("figures", "HMDA-n=10pct-$(penalty_name).pdf"), current_figure())
+    save(joinpath("figures", "HMDA-n=$(pct)pct-$(penalty_name).pdf"), current_figure())
+    display(current_figure())
 
     tbl = DataFrame()
     for r in results
@@ -455,9 +460,17 @@ function run_yu2025()
       )
     end
 
-    open(joinpath("tables", "HMDA-n=10pct-$(penalty_name).txt"), "w") do io
+    open(joinpath("tables", "HMDA-n=$(pct)pct-$(penalty_name).txt"), "w") do io
       pretty_table(io, tbl; backend = :latex)
     end
+    display(tbl)
+
+    JLD2.save(
+      joinpath("models", "HMDA-n=$(pct)pct-$(penalty_name).jld2"),
+      Dict(
+        "$(k)" => r.vertex for (k, r) in enumerate(results)
+      )
+    )
   end
 end
 end # module

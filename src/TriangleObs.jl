@@ -19,10 +19,29 @@ struct TriangleObs
   S::Matrix{Float64}  # Cartesian coordiantes, stored in columns
   A::Matrix{Float64}  # mixture weights as barycentric coordinates, stored in columns
   V::Matrix{Float64}  # vertices of triangle, stored in columns
+
+  function TriangleObs(
+    triangle::NTuple{3,Int},
+    idx::Vector{Int},
+    y::Vector{Float64},
+    X::Matrix{Float64},
+    S::Matrix{Float64},
+    A::Matrix{Float64},
+    V::Matrix{Float64}
+  )
+    #
+    @assert triangle[1] < triangle[2] < triangle[3] "Encountered violation of triangle invariant j < k < l"
+    @assert length(y) == length(idx)
+    @assert length(y) == size(X, 1)
+    @assert length(y) == size(S, 2)
+    @assert length(y) == size(A, 2)
+    @assert size(V) == (2, 3)
+    new(triangle, idx, y, X, S, A, V)
+  end
 end
 
 """
-    create_triobs_sets(y, X, S, tri::Triangulation; nchunks::Int = Threads.nthreads())
+    create_triobs_set(y, X, S, tri::Triangulation; nchunks::Int = Threads.nthreads())
 
 Create a `Vector` of `TriangleObs` instances from the spatial data `(y, X, S)` over mesh `tri`.
 
@@ -40,7 +59,7 @@ This effectively assigns each observation to a unique triangle within triangulat
 - `nchunks`: The number of parallel tasks to use in assigning each observation to a triangle.
   The default references the result of `Threads.nthreads()`.
 """
-function create_triobs_sets(y, X, S, tri::Triangulation; nchunks::Int = Threads.nthreads())
+function create_triobs_set(y, X, S, tri::Triangulation; nchunks::Int = Threads.nthreads())
   # Get points + mapping to solid vertices.
   # The mapping is needed to ensure vertex label = index into some array
   vertex = get_points(tri)
@@ -72,10 +91,10 @@ end
 function _assign_data_to_triangles(tri, id2vertex, S, nchunks)
   TriType = Tuple{Int,Int,Int}
   IdxType = Vector{Int}
-  cases = OhMyThreads.ChannelLike(axes(S, 2))
+  cases = ChannelLike(axes(S, 2))
 
   # Build mapping in parallel; don't care about sorting keys or indices yet.
-  tmp = OhMyThreads.@localize tri id2vertex cases OhMyThreads.tmap(Dict{TriType,IdxType}, 1:nchunks; chunking = false) do _
+  tmp = @localize tri id2vertex cases tmap(Dict{TriType,IdxType}, 1:nchunks; chunking = false) do _
     local tri2idx = Dict{TriType,IdxType}()
     for i in cases
       # Check whether i-th case lies inside any triangle of the mesh
@@ -130,3 +149,40 @@ function get_triangle_vertices(Tobs::TriangleObs, index)
   end
   return pos
 end
+
+# check if triangle has vertex with index j as one of its vertices
+has_vertex(T::TriangleObs, j::Int) = j in T.triangle
+
+struct TriangleObsIterator{T}
+  triobs::Vector{TriangleObs}
+  subset::T
+end
+
+TriangleObsIterator(triobs::Vector{TriangleObs}) = TriangleObsIterator(triobs, eachindex(triobs))
+TriangleObsIterator(triobs::Vector{TriangleObs}, subset::Base.OneTo{Int}) = TriangleObsIterator(triobs, UnitRange(subset))
+
+ChunkSplitters.is_chunkable(::TriangleObsIterator) = true
+
+Base.length(itr::TriangleObsIterator) = length(itr.subset)
+
+function Base.eltype(itr::TriangleObsIterator)
+  triobs = itr.triobs
+  return Tuple{typeof(first(triobs).triangle), eltype(triobs)}
+end
+
+function Base.iterate(itr::TriangleObsIterator, state = 1)
+  if state > length(itr.subset)
+    return nothing
+  else
+    k = itr.subset[state]
+    triobs = itr.triobs[k]
+    triidx = triobs.triangle
+    item = (triidx, triobs)
+    return (item, state + 1)
+  end
+end
+
+Base.firstindex(::TriangleObsIterator) = 1
+Base.lastindex(itr::TriangleObsIterator) = length(itr.subset)
+Base.view(itr::TriangleObsIterator, idx::UnitRange) = TriangleObsIterator(itr.triobs, @views itr.subset[idx])
+Base.view(itr::TriangleObsIterator, idx::StepRange) = TriangleObsIterator(itr.triobs, @views itr.subset[idx])

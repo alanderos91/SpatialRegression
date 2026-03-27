@@ -4,6 +4,7 @@ version = "1.0.0-DEV"
 authors = ["Alfonso Landeros <alandero@ucr.edu> and contributors"]
 
 [deps]
+ChunkSplitters = "ae650224-84b6-46f8-82ea-d812ca08434e"
 DelaunayTriangulation = "927a84f5-c5f4-47a5-9785-b46e178433df"
 Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
 ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
@@ -15,6 +16,7 @@ SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 
 [compat]
+ChunkSplitters = "3.2.0"
 DelaunayTriangulation = "1.6.5"
 Distributions = "0.25.122"
 ForwardDiff = "1.2.2"
