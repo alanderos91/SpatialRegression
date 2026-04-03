@@ -20,7 +20,7 @@ export Distribution, UnivariateDistribution,
 #
 # LOG-LIKELIHOOD: Use mean parameter only
 #
-log_likelihood(y, mu, ::Normal, n = one(y)) = -abs2(y - mu)
+log_likelihood(y, mu, ::Normal, n = one(y)) = -1//2*abs2(y - mu)
 log_likelihood(y, mu, ::Bernoulli, n = one(y)) = isone(y) ? log(mu) : log(1-mu)
 log_likelihood(y, mu, ::Binomial, n = one(y)) = begin
   if isone(n)
@@ -67,9 +67,9 @@ export meanfun, linpred
 #
 meanderiv(::IdentityLink, eta) = one(eta)
 meanderiv(::LogitLink, eta) = begin
-  CUTOFF = abs(log(eps(typeof(eta))))
+  CUTOFF = abs(log10(eps(zero(eta))))
   eta = clamp(eta, -CUTOFF, CUTOFF)
-  return inv(2 * cosh(eta/2))^2
+  return exp(loglogistic(eta) + log1mlogistic(eta))
 end
 meanderiv(::LogLink, eta) = exp(eta)
 
@@ -78,7 +78,7 @@ export meanderiv
 # VARIANCE FUNCTIONS
 #
 varfun(::Normal, mu) = one(mu)
-varfun(::Union{Bernoulli,Binomial}, mu) = mu * (1+mu)
+varfun(::Union{Bernoulli,Binomial}, mu) = mu * (1-mu)
 varfun(::Poisson) = mu
 
 export varfun
@@ -101,7 +101,7 @@ mustart(::Bernoulli, y) = (y + oftype(y, 1/2)) / 2
 mustart(::Binomial, y) = mustart(Bernoulli(), y)
 mustart(::Poisson, y) = begin
   fy = float(y)
-  fy + oftype(fy, 1/2)
+  fy + oftype(fy, 1/10)
 end
 
 export mustart

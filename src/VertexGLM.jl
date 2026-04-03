@@ -213,8 +213,8 @@ function mm_update!(penalty::AbstractPenalty, g::VertexSurrogate, v::V, triobs::
         d[idx] = zweight * stable_irls_weight(family, link, η[idx], μ[idx], dμdη)
 
         # Evaluate gradient + Hessian
-        BLAS.axpy!(-2*d[idx]*r[idx], x, ∇L)
-        BLAS.syr!('U', 2*d[idx], x, ∇²L)
+        BLAS.axpy!(-d[idx]*r[idx], x, ∇L)
+        BLAS.syr!('U', d[idx], x, ∇²L)
       end
     end
     accumulate_penalty_derivs!(penalty, ∇L, ∇²L, v, Γ, g.rho)
