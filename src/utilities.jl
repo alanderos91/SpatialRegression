@@ -89,16 +89,17 @@ function linesearch!(f, βₙ₊₁, βₙ, Δ, backtrack)
   objective = f(βₙ)
   for step in 0:backtrack
     @. βₙ₊₁ = βₙ - t * Δ
-    objective_new = f(βₙ₊₁)
-    if (objective_new <= objective + objective_new * 1e-6) || isapprox(objective_new, objective, atol = sqrt(eps()))
-      break
-    elseif step < backtrack
-      t /= 2
-    else
-      @warn("Backtracking failed after $(step) attempts!")
-      @. βₙ₊₁ = βₙ
-      break
-    end
+    # objective_new = f(βₙ₊₁)
+    # if (objective_new <= objective + objective_new * 1e-6) || isapprox(objective_new, objective, atol = sqrt(eps()))
+    #   break
+    # elseif step < backtrack
+    #   t /= 2
+    # else
+    #   @warn("Backtracking failed after $(step) attempts!")
+    #   @. βₙ₊₁ = βₙ
+    #   break
+    # end
+    break
   end
   return t
 end
