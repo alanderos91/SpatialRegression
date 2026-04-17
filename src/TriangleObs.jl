@@ -62,13 +62,15 @@ This effectively assigns each observation to a unique triangle within triangulat
 function create_triobs_set(y, X, S, tri::Triangulation; nchunks::Int = Threads.nthreads())
   # Get points + mapping to solid vertices.
   # The mapping is needed to ensure vertex label = index into some array
-  vertex = get_points(tri)
+  indices = each_solid_vertex(tri) |> collect |> sort
+  vertex = [[get_point(tri, v)...] for v in indices]
+  points = get_points(tri) # should probably save the coordinates, too
   id2vertex = Dict{Int,Int}()
 
   # Matrix of vertices, stored along columns
   V = Matrix{Float64}(undef, 2, length(vertex))
-  for (j, id) in enumerate(each_solid_vertex(tri))
-    V[:, j] .= vertex[id]
+  for (j, id) in enumerate(indices)
+    V[:, j] .= vertex[j] # points[id]
     id2vertex[id] = j
   end
 

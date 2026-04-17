@@ -27,20 +27,6 @@ function equilateral_refinement(Δ, max_area)
   return Δnew
 end
 
-function create_component(family::Normal, link, η)
-  σ = scale(family)
-  μ = SpatialRegression.meanfun(link, η)
-  return Normal(μ, σ)
-end
-
-function create_component(::Binomial, link, η)
-  return Bernoulli(SpatialRegression.meanfun(link, η))
-end
-
-function create_component(::Poisson, link, η)
-  return Poisson(SpatialRegression.meanfun(link, η))
-end
-
 function simulate_data(n, p, Δ, family, link)
   # Sample from the standard 2-simplex, then convert to Cartesian coords
   A = rand(Dirichlet(ones(3)), n)
@@ -48,20 +34,28 @@ function simulate_data(n, p, Δ, family, link)
   S = SpatialRegression.cartesian(A, V)
 
   # Simulate responses at each location according to true model
-  Bfun(x, y, k, n) = (1 - (1 - 2*(x+1/2*cos(pi*k/n)))^2) * (1 - (1 - 2*(y+1/2 + 1/2*sin(pi*k/n)))^2)
-  vertices = [[get_point(Δ, v)...] for v in each_solid_vertex(Δ)]
+  Bfun(x, y) = -10*sin(7*π*(x + 0.15)) + 10*sin(7*π*y)
+  indices = each_solid_vertex(Δ) |> collect |> sort
+  vertices = [[get_point(Δ, v)...] for v in indices]
   points = get_points(Δ)
-  id2vertex = Dict{Int,Int}(id => j for (j, id) in enumerate(each_solid_vertex(Δ)))
+  id2vertex = Dict{Int,Int}(id => j for (j, id) in enumerate(indices))
   X = 1/p*rand(Uniform(-1, 1), n, p)
   X[:, 1] .= 1
-  B = [Bfun(s[1], s[2], j-1, p) for j in 1:p, s in vertices]
+  B = [1//8 * Bfun(s[1], s[2]) for j in 1:p, s in vertices]
   if family isa Poisson
-    B[1, :] .= rand(Uniform(3, 4), size(B, 2))
-    B[2:end, :] .*= 1/4
+    # B[1, :] .= rand(Uniform(3, 4), size(B, 2))
+    # B[2:end, :] .*= 1/4
+    B .+= 3
   else
-    B[1, :] .= rand(Uniform(-3, 3), size(B, 2))
+    # B[1, :] .= rand(Uniform(-3, 3), size(B, 2))
+  end
+  if family isa Normal
+    Φ = rand(1*Beta(2.0, 5.0), length(vertices))
+  else
+    Φ = ones(length(vertices))
   end
   y = zeros(n)
+  H = MixtureModel[]
   for i in 1:n
     s = @views S[:, i]
     j, k, l = find_triangle(Δ, s; concavity_protection = true) |> sort
@@ -69,17 +63,19 @@ function simulate_data(n, p, Δ, family, link)
     j, k, l = id2vertex[j], id2vertex[k], id2vertex[l]
     b1, b2, b3 = @views begin B[:, j], B[:, k], B[:, l] end
     a1, a2, a3 = SpatialRegression.barycentric(s, [v1 v2 v3])
+    φ1, φ2, φ3 = Φ[j], Φ[k], Φ[l]
     mixture = @views MixtureModel(
       [
-        create_component(family, link, dot(X[i, :], b1)),
-        create_component(family, link, dot(X[i, :], b2)),
-        create_component(family, link, dot(X[i, :], b3)),
+        SpatialRegression.create_component(family, link, dot(X[i, :], b1), φ1),
+        SpatialRegression.create_component(family, link, dot(X[i, :], b2), φ2),
+        SpatialRegression.create_component(family, link, dot(X[i, :], b3), φ3),
       ],
       [a1, a2, a3]
     )
     y[i] = rand(mixture)
+    push!(H, mixture)
   end
-  return y, X, S, B
+  return y, X, S, B, Φ, H
 end
 
 #
