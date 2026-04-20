@@ -35,7 +35,6 @@ export TriangleObs,
   VertexGLM,
   SpatialVertexModel
 
-include("stable.jl")
 include("penalty.jl")
 export L2Squared, L1Approx
 
