@@ -22,7 +22,13 @@ export Distribution, UnivariateDistribution, MixtureModel,
 #
 # LOG-LIKELIHOOD: Use mean parameter only
 #
-logpdf(y, mu, phi, ::Normal, n = one(y)) = -1//2 * (abs2(y - mu) * phi + log(2*π/phi))
+function logpdf(y, mu, phi, ::Normal, n = one(y))
+  if isfinite(phi)
+    -1//2 * (abs2(y - mu) * phi + log(2*π/phi))
+  else
+    y == mu ? typemax(phi) : typemin(phi)
+  end
+end
 logpdf(y, mu, phi, ::Bernoulli, n = one(y)) = isone(y) ? log(mu) : log(1-mu)
 logpdf(y, mu, phi, ::Binomial, n = one(y)) = begin
   if isone(n)

@@ -1,90 +1,54 @@
-struct VertexGLM{D <: Distribution, L <: Link} <: AbstractVertexModel
-  family::D                   # distribution
-  link::L                     # link function, g(μ) = η
+struct VertexGLM{D <: UnivariateDistribution, L <: Link} <: AbstractVertexModel
   index::Int                  # vertex index, needed for consitency with triangulation
   part::Vector{UnitRange{Int}}# partition of indices into incident triangles
+  triangles::Vector{Int}      # index set representing incident triangles
+  neighbors::Vector{Int}      # index set representing neighboring vertices in penalty
+  weights::Vector{Float64}    # penalty weights, w in ∑ w P(B)
+
+  nobs::Int                   # number of incident observations
+  nvar::Int                   # number of variables + intercept 
+  family::D                   # distribution
+  link::L                     # link function, g(μ) = η
   d::Vector{Float64}          # IRLS weights, determined by GLM + mixture coefficients
   beta::Vector{Float64}       # coefficients, β
+  beta_new::Vector{Float64}   # proposed update
   eta::Vector{Float64}        # linear predictor, η = xᵀβ
   mu::Vector{Float64}         # mean parameter vector, μ = g⁻¹(η)
   workres::Vector{Float64}    # working residuals, (y - μ) g'(μ)
-  neighbors::Vector{Int}      # index set representing neighboring vertices in penalty
-  triangles::Vector{Int}      # index set representing incident triangles
-  weights::Vector{Float64}    # penalty weights, w in ∑ w P(B)
-  beta_new::Vector{Float64}   # proposed update
   extra_params::Dict{Symbol,Float64}
 end
 
-function create_vertex_set(::Type{VertexGLM}, tri::Triangulation, triobs::Vector{TriangleObs}, nvars::Int;
-  family::D = Normal(),
-  link::L = canonicallink(family),
-  ) where {D <: UnivariateDistribution, L <: Link}
-  vertex = VertexGLM{D,L}[]
-  
-  # recreate mapping from triangulation labels to our labels
-  indices = each_solid_vertex(tri) |> collect |> sort
-  id2vertex = Dict{Int,Int}(id => j for (j, id) in enumerate(indices))
-  
-  # This assumes triangles in tobs are labeled using OUR scheme, not the one in the triangulation.
-  wmax = 0.0
-  for (j, id) in enumerate(indices)
-    # count the total number of samples incident with vertex j
-    nsamples, part, triangles = 0, UnitRange{Int}[], Int[]
-    for k in eachindex(triobs)
-      if has_vertex(triobs[k], j)
-        n = length(triobs[k].y)
-        push!(part, (1+nsamples):(nsamples+n))
-        push!(triangles, k)
-        nsamples += n
-      end
-    end
+infer_vertex_type(::Type{VertexGLM}, ::D, ::L; kwargs...) where {D <: UnivariateDistribution, L <: Link} = VertexGLM{D,L}
 
-    # determine the number of incident vertices
-    neighbors = [id2vertex[u] for u in DelaunayTriangulation.iterated_neighbourhood(tri, id, 1)]
-    sort!(neighbors)
-    nneighbors = length(neighbors)
-
-    # allocate!
-    d = zeros(nsamples)
-    beta = zeros(nvars)
-    eta = zeros(nsamples)
-    mu = zeros(nsamples)
-    workres = zeros(nsamples)
-    weights = ones(nneighbors)
-
-    for (k, other) in enumerate(DelaunayTriangulation.iterated_neighbourhood(tri, id, 1))
-      weights[k] = 1 / DelaunayTriangulation.dist(get_point(tri, id), get_point(tri, other))
-      wmax = max(wmax, weights[k])
-    end
-
-    push!(vertex, VertexGLM(family, link, j, part,
-        d, beta, eta, mu, workres,
-        neighbors, triangles, weights, similar(beta),
-        Dict(:dispersion => 1.0),
-      )
-    )
-  end
-  
-  for v in vertex
-    v.weights .= v.weights / wmax
-  end
-
-  return vertex
+function create_vertex(::Type{VertexGLM{D,L}}, index, part, triangles, neighbors, weights, nobs, nvar; family::D=Normal(), link::L=IdentityLink(), kwargs...) where {D <: UnivariateDistribution, L <: Link}
+  d = zeros(nobs)
+  beta = zeros(nvar)
+  beta_new = similar(beta)
+  eta = zeros(nobs)
+  mu = zeros(nobs)
+  workres = zeros(nobs)
+  extra_params = Dict(:dispersion => 1.0)
+  return VertexGLM(
+    index, part, triangles, neighbors, weights,
+    nobs, nvar, family, link, d, beta, beta_new,
+    eta, mu, workres, extra_params
+  )
 end
 #
 # CACHES
 #
-function build_caches(triobs::Vector{TriangleObs}, vertex::Vector{V}, ::AbstractPenalty, nvars, nchunks) where V <: VertexGLM
+function build_caches(triobs::Vector{TriangleObs}, vertex::Vector{V}, ::AbstractPenalty, nvar, nchunks) where V <: VertexGLM
   return (;
     # Store log-likelihood values for each triangle
-    logf = Dict(triidx => zeros(3, length(t.y)) for (triidx, t) in TriangleObsIterator(triobs)),
+    logf = init_cache_logf(triobs),
     # matrix of local average coefficients in MM algorithm, Γ
-    gamma = Dict(v.index => zeros(nvars, length(v.neighbors)) for v in vertex),
-    workspace = [(zeros(nvars), zeros(nvars, nvars), zeros(nvars)) for _ in 1:nchunks]
+    gamma = init_cache_gamma(vertex, nvar),
+    # ∇L, ∇²L, Δ
+    workspace = [(zeros(nvar), zeros(nvar, nvar), zeros(nvar)) for _ in 1:nchunks]
   )
 end
 
-function update_caches!(model::SpatialVertexModel{V}; nchunks::Int = Threads.nthreads()) where V <: VertexGLM
+function update_caches!(model::SpatialVertexModel{<:VertexGLM}; nchunks::Int = Threads.nthreads())
   workitr = ChannelLike(eachvertex(model))
   @safe_blas begin
     @localize model tforeach(1:nchunks; chunking = false) do _
@@ -96,68 +60,16 @@ function update_caches!(model::SpatialVertexModel{V}; nchunks::Int = Threads.nth
   end nchunks=nchunks
 end
 
-function update_caches_serial!(model::SpatialVertexModel{V}) where V <: VertexGLM
+function update_caches_serial!(model::SpatialVertexModel{<:VertexGLM})
   for v in eachvertex(model)
     update_cache_logf!(model.caches.logf, v, model.triobs)
     update_cache_gamma!(model.caches.gamma, v, model.vertex)
   end
 end
-
-function update_cache_logf!(cache, v::VertexGLM, triobs::Vector{TriangleObs})
-  j, β, η, μ = v.index, v.beta, v.eta, v.mu
-  family, link = v.family, v.link
-  φ = v.extra_params[:dispersion]
-  for (k, idxrange) in zip(v.triangles, v.part)
-    T = triobs[k]
-    triidx, y, X = T.triangle, T.y, T.X
-    t = get_triangle_vertices(T, j)
-    logf = view(cache[triidx], t, :)
-    mul!(view(η, idxrange), X, β) # η = Xβ
-    @inbounds for (i, idx) in zip(eachindex(logf, y), idxrange)
-      μ[idx] = meanfun(link, η[idx])
-      logfᵢ = GLMUtilities.logpdf(y[i], μ[idx], φ, η[idx], family, link)
-      logf[i] = logfᵢ
-    end
-  end
-end
-
-function update_cache_gamma!(cache, v::V, vertex::Vector{V}) where V <: VertexGLM
-  β = v.beta
-  Γ = cache[v.index]
-  for (i, k) in zip(axes(Γ, 2), v.neighbors)
-    βₖ = vertex[k].beta
-    @views begin
-      @. Γ[:, i] = 1//2 * (β + βₖ)
-    end
-  end
-end
-#
-# LOSS
-#
-function eval_loss(triobs::Vector{TriangleObs}, ::Vector{V}, caches; nchunks::Int = Threads.nthreads()) where V <: VertexGLM
-  cache = caches.logf
-  logl = @localize cache @tasks for T in triobs
-    @set begin
-      ntasks = nchunks
-      reducer = +
-      outputtype = Float64
-    end
-    triidx = T.triangle # can't use eachtriobs() here due to type instability
-    local c = zero(Float64)
-    for i in eachobsindex(T)
-      alpha = view(T.A, :, i)
-      logf = view(cache[triidx], :, i)
-      tmp = weighted_logsumexp(alpha, logf)
-      c += tmp
-    end
-    c
-  end
-  return -logl
-end
 #
 # SURROGATE
 #
-function eval_loss_surrogate(beta, v::V, triobs::Vector{TriangleObs}, caches) where V <: VertexGLM
+function eval_loss_surrogate(beta::Vector, v::VertexGLM, triobs::Vector{TriangleObs}, caches)
   cache = caches.logf
   logl = zero(Float64)
   phi = v.extra_params[:dispersion]
@@ -177,7 +89,34 @@ function eval_loss_surrogate(beta, v::V, triobs::Vector{TriangleObs}, caches) wh
       # Evaluate terms dependent on the anchor point βₙ
       zweight = stable_convex_weight(t, alpha, logf)
       tmp = zweight < eps() ? zero(zweight) : zweight * logfⱼ + zweight * (log(alpha[t]) + log(inv(zweight)))
-      @assert !isnan(tmp) && !isinf(tmp) "bad weighted log-likelihood @ vertex $(v.index)\n\tη: $(eta)\n\tμ: $(mu)\n\tlogf: $(logfⱼ)\n\tz: $(zweight)"
+      @assert !isnan(tmp) && !isinf(tmp) "bad weighted log-likelihood @ vertex $(v.index)\n\tη: $(eta)\n\tμ: $(mu)\n\tφ: $(phi)\n\tlogf: $(logfⱼ)\n\tz: $(zweight)"
+      logl += tmp
+    end
+  end
+  return -logl
+end
+
+function eval_loss_surrogate(phi::Real, v::VertexGLM, triobs::Vector{TriangleObs}, caches)
+  cache = caches.logf
+  logl = zero(Float64)
+  beta = v.beta
+  j, family, link = v.index, v.family, v.link
+  for (triidx, T) in eachtriobs(triobs, v)
+    t = get_triangle_vertices(T, j)
+    for i in eachobsindex(T)
+      x = view(T.X, i, :)
+      alpha = view(T.A, :, i)
+      logf = view(cache[triidx], :, i)
+
+      # Evaluate log-likelihood term at β
+      eta = dot(x, beta)
+      mu = meanfun(link, eta)
+      logfⱼ = GLMUtilities.logpdf(T.y[i], mu, phi, eta, family, link)
+
+      # Evaluate terms dependent on the anchor point φₙ
+      zweight = stable_convex_weight(t, alpha, logf)
+      tmp = zweight < eps() ? zero(zweight) : zweight * logfⱼ + zweight * (log(alpha[t]) + log(inv(zweight)))
+      @assert !isnan(tmp) && !isinf(tmp) "bad weighted log-likelihood @ vertex $(v.index)\n\tNobs: $(v.nobs)\n\tη: $(eta)\n\tμ: $(mu)\n\tφ: $(phi)\n\tlogf: $(logfⱼ)\n\tz: $(zweight)"
       logl += tmp
     end
   end
@@ -202,7 +141,7 @@ function initialize_coefficients!(v::VertexGLM, triobs, vertex)
   return nothing
 end
 
-function mm_update_coef!(penalty::AbstractPenalty, g::VertexSurrogate, v::V, triobs::Vector{TriangleObs}, workspace, caches, backtrack) where V <: VertexGLM
+function mm_update_coef!(penalty::AbstractPenalty, g::VertexSurrogate, v::VertexGLM, triobs::Vector{TriangleObs}, workspace, caches, opt)
   # Setup local variables to match notation
   family = v.family
   link = v.link
@@ -213,66 +152,54 @@ function mm_update_coef!(penalty::AbstractPenalty, g::VertexSurrogate, v::V, tri
   μ = v.mu
   w = v.weights
   ∇L, ∇²L, Δ = workspace
+  backtrack = opt.backtrack
 
   fill!(∇L, 0); fill!(∇²L, 0)
-  if isempty(v.triangles)
-    # Case: Incident observation sets are empty
-    # Update the coefficients using the penalty term
-    update_empty_case!(penalty, v, w, Γ)
+  itr = zip(eachtriobs(triobs, v), v.part)
+  phi = v.extra_params[:dispersion]
 
-    # Dispersion parameter cannot be determined, so we keep it equal to 1.
-  else
-    # Case: There is at least one non-empty observation set
-    itr = zip(eachtriobs(triobs, v), v.part)
-    phi = v.extra_params[:dispersion]
-
-    # Update the coefficients using IRWLS
-    for ((triidx, T), idxrange) in itr
-      y, X, A, t = T.y, T.X, T.A, get_triangle_vertices(T, v.index)
-      for (i, idx) in zip(eachobsindex(T), idxrange)
-        x = view(X, i, :)
-        alpha = view(A, :, i)
-        logf = view(caches.logf[triidx], :, i)
-        zweight = stable_convex_weight(t, alpha, logf)
-        dμdη = meanderiv(v.link, η[idx]) 
-        r[idx] = (y[i] - μ[idx]) / dμdη
-        d[idx] = zweight * stable_irls_weight(family, link, η[idx], μ[idx], dμdη)
-        if iszero(zweight)
-            d[idx] = one(zweight)
-            r[idx] = zero(zweight)
-        end
-        # @assert zweight > 0 "MM Update w/ Zero Weight @ Vertex $(v.index)\n\tObs. Index: $(idx)\n\talpha = $(alpha)\n\tlogf = $(logf)\n\tResidual: $(r[idx])\n\tIRLS Weight: $(stable_irls_weight(family, link, η[idx], μ[idx], dμdη))"
-
-        # Evaluate gradient + Hessian
-        BLAS.axpy!(-d[idx]*r[idx] * dispfun(family, phi), x, ∇L)
-        BLAS.syr!('U', d[idx] * dispfun(family, phi), x, ∇²L)
+  # Update the coefficients using IRWLS
+  for ((triidx, T), idxrange) in itr
+    y, X, A, t = T.y, T.X, T.A, get_triangle_vertices(T, v.index)
+    for (i, idx) in zip(eachobsindex(T), idxrange)
+      x = view(X, i, :)
+      alpha = view(A, :, i)
+      logf = view(caches.logf[triidx], :, i)
+      zweight = stable_convex_weight(t, alpha, logf)
+      dμdη = meanderiv(v.link, η[idx]) 
+      r[idx] = (y[i] - μ[idx]) / dμdη
+      d[idx] = zweight * stable_irls_weight(family, link, η[idx], μ[idx], dμdη)
+      if iszero(zweight)
+          d[idx] = one(zweight)
+          r[idx] = zero(zweight)
       end
+      # @assert zweight > 0 "MM Update w/ Zero Weight @ Vertex $(v.index)\n\tObs. Index: $(idx)\n\talpha = $(alpha)\n\tlogf = $(logf)\n\tResidual: $(r[idx])\n\tIRLS Weight: $(stable_irls_weight(family, link, η[idx], μ[idx], dμdη))"
+
+      # Evaluate gradient + Hessian
+      BLAS.axpy!(-d[idx]*r[idx] * dispfun(family, phi), x, ∇L)
+      BLAS.syr!('U', d[idx] * dispfun(family, phi), x, ∇²L)
     end
-    accumulate_penalty_derivs!(penalty, ∇L, ∇²L, v, Γ, g.rho)
-    H = Symmetric(∇²L, :U)
-    ldiv!(Δ, cholesky!(H), ∇L)
-    linesearch!(g, v.beta_new, v.beta, Δ, backtrack)
   end
+  accumulate_penalty_derivs!(penalty, ∇L, ∇²L, v, Γ, g.rho)
+  H = Symmetric(∇²L, :U)
+  ldiv!(Δ, cholesky!(H), ∇L)
+  linesearch!(g, v.beta_new, v.beta, Δ, backtrack)
 end
 
-function mm_update_disp!(::Distribution, g::VertexSurrogate, v::V, triobs::Vector{TriangleObs}, workspace, caches) where V <: VertexGLM
+function mm_update_disp!(::UnivariateDistribution, g::VertexSurrogate, v::VertexGLM, triobs::Vector{TriangleObs}, workspace, caches)
   error("MM updates not implemented for the $(v.family) case.")
 end
 
-function mm_update_disp!(::Normal, g::VertexSurrogate, v::V, triobs::Vector{TriangleObs}, workspace, caches) where V <: VertexGLM
+function mm_update_disp!(::Normal, g::VertexSurrogate, v::VertexGLM, triobs::Vector{TriangleObs}, workspace, caches)
   # Setup local variables to match notation
-  family = v.family
-  link = v.link
-  d = v.d
-  r = v.workres
   η = v.eta
   μ = v.mu
 
+  phi_old = v.extra_params[:dispersion]
+  g_prev = g(phi_old)
   itr = zip(eachtriobs(triobs, v), v.part)
-  g_prev = g(v.beta)
 
   # Fix β, update φ
-  N = 0
   num = den = zero(eltype(v.beta))
   for ((triidx, T), idxrange) in itr
     y, X, A, t = T.y, T.X, T.A, get_triangle_vertices(T, v.index)
@@ -282,23 +209,23 @@ function mm_update_disp!(::Normal, g::VertexSurrogate, v::V, triobs::Vector{Tria
       logf = view(caches.logf[triidx], :, i)
       zweight = stable_convex_weight(t, alpha, logf)
       η[idx] = dot(x, v.beta)
-      μ[idx] = meanfun(link, η[idx])
-      num += zweight * abs2(y[i] - μ[idx])
+      μ[idx] = meanfun(v.link, η[idx])
+      num += zweight * deviance(v.family, y[i], μ[idx])
       den += zweight
-      N += 1
-      # v.index == 408 && @show zweight, abs2(y[i] - μ[idx])
+      # v.index == 1 && @show zweight, deviance(v.family, y[i], μ[idx])
     end
   end
   phi = den / num
-  v.extra_params[:dispersion] = isinf(phi) ? one(phi) : phi 
 
-  g_curr = g(v.beta)
-  @assert abs(g_curr - g_prev) <= 10 * (1 + abs(g_prev)) "\n\tVertex: $(v.index)\n\tNobs: $(N)\n\tPrevious: $(g_prev)\n\t Current: $(g_curr)\n\tDen/Num: $(den) / $(num)\n\tφ: $(phi)\n\tβ: $(v.beta)"
-  # @assert g_curr <= g_prev "\n\tVertex: $(v.index)\n\tNobs: $(N)\n\tPrevious: $(g_prev)\n\t Current: $(g_curr)\n\tDen/Num: $(den) / $(num)\n\tφ: $(phi)\n\tβ: $(v.beta)"
+  g_curr = g(phi)
+  @assert g_curr < g_prev || abs(g_curr - g_prev) < sqrt(eps()) * (1 + abs(g_prev)) "\n\tVertex: $(v.index)\n\tNobs: $(v.nobs)\n\tPrevious: $(g_prev)\n\t Current: $(g_curr)\n\tDen/Num: $(den) / $(num)\n\tφ₀: $(phi_old)\n\tφ: $(phi)\n\tβ: $(v.beta)"
 
+  v.extra_params[:dispersion] = isinf(phi) ? one(phi) : phi
 end
 
-function fitmodel(::Type{V}, yfull, Xfull, Sfull, tri;
+function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
+    family::D = Normal(),
+    link::L = IdentityLink(),
     maxiter::Int = 100,
     backtrack::Int = 5,
     tol::Real = 1e-3,
@@ -306,73 +233,41 @@ function fitmodel(::Type{V}, yfull, Xfull, Sfull, tri;
     nchunks::Int = Threads.nthreads(),
     kwargs...
     # intercept = all(isequal(1), view(Xfull, :, 1)),
-  ) where V <: VertexGLM
+  ) where {D <: UnivariateDistribution, L <: Link}
   # Initialize
-  nvars = size(Xfull, 2)
-  model = f = create_model(V, yfull, Xfull, Sfull, tri; nchunks, kwargs...)
+  VT = infer_vertex_type(VertexGLM, family, link; kwargs...)
+  model = f = create_model(VT, yfull, Xfull, Sfull, tri; nchunks, family, link, kwargs...)
   initialize_coefficients!(model.triobs, model.vertex)
   update_caches!(model; nchunks)
   nlogl = f(rho; nchunks)
   nlogl_prev = zero(nlogl)
   iter = 0
+  opt = (; rho = rho,  backtrack = backtrack)
   while iter < maxiter && abs(nlogl - nlogl_prev) > (1 + abs(nlogl_prev)) * tol
     iter += 1
 
     # Visit each vertex once to update local regression coefficients
-    workspace = ChannelLike(model.caches.workspace)
-    workitr = ChannelLike(eachvertex(model))
-    @safe_blas begin
-      @localize iter model rho backtrack workspace workitr tforeach(1:nchunks; chunking = false) do _
-        map(workspace) do wrk
-          for v in workitr
-            g = VertexSurrogate(v.index, model, rho)
-            if isempty(v.triangles)
-              update_empty_case!(model.penalty, v, v.weights, model.caches)
-            else
-              mm_update_coef!(model.penalty, g, v, model.triobs, wrk, model.caches, backtrack)
-            end
-          end
-        end
-      end
-    end nchunks=nchunks
-
-    # Apply all updates
-    for v in eachvertex(model)
-      @. v.beta = v.beta_new
-    end
+    update_coefficients!(model, opt, nchunks)
 
     # Evaluate log-likelihood
     update_caches!(model; nchunks)
     nlogl_prev = nlogl
     nlogl = f(rho; nchunks)
     @show iter, nlogl, nlogl_prev - nlogl
-    @assert nlogl < nlogl_prev
+    @assert nlogl < nlogl_prev || abs(nlogl - nlogl_prev) < sqrt(eps()) * (1 + abs(nlogl_prev))
 
     if needs_dispersion(first(model.vertex).family) # TODO
       abs(nlogl - nlogl_prev) <= (1 + abs(nlogl_prev)) * tol && break
 
       # Visit each vertex once to update local dispersion parameters
-      workspace = ChannelLike(model.caches.workspace)
-      workitr = ChannelLike(eachvertex(model))
-      @safe_blas begin
-        @localize iter model rho workspace workitr tforeach(1:nchunks; chunking = false) do _
-          map(workspace) do wrk
-            for v in workitr
-              if !isempty(v.triangles)
-                g = VertexSurrogate(v.index, model, rho)
-                mm_update_disp!(v.family, g, v, model.triobs, wrk, model.caches)
-              end
-            end
-          end
-        end
-      end nchunks=nchunks
+      update_dispersion!(model, opt, nchunks)
 
       # Evaluate log-likelihood
       update_caches!(model; nchunks)
       nlogl_prev = nlogl
       nlogl = f(rho; nchunks)
       @show iter, nlogl, nlogl_prev - nlogl
-      @assert nlogl < nlogl_prev
+      @assert nlogl < nlogl_prev || abs(nlogl - nlogl_prev) < sqrt(eps()) * (1 + abs(nlogl_prev))
     end
   end
 

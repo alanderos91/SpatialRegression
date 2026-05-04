@@ -36,7 +36,11 @@ function eval_penalty(p::L1Approx, vmod)
   return penalty
 end
 
-function eval_penalty_surrogate(::L2Squared, beta, weights, gamma, betan)
+function eval_penalty_surrogate(penalty::AbstractPenalty, ::Real, weights, gamma, betan)
+  eval_penalty_surrogate(penalty, betan, weights, gamma, betan)
+end
+
+function eval_penalty_surrogate(::L2Squared, beta::Vector, weights, gamma, betan)
   penalty = zero(Float64)
   for (idx, γ) in enumerate(eachcol(gamma))
     diff = zero(eltype(beta))
@@ -48,7 +52,7 @@ function eval_penalty_surrogate(::L2Squared, beta, weights, gamma, betan)
   return penalty
 end
 
-function eval_penalty_surrogate(p::L1Approx, beta, weights, gamma, betan)
+function eval_penalty_surrogate(p::L1Approx, beta::Vector, weights, gamma, betan)
   epsilon = p.epsilon
   penalty = zero(Float64)
   for (idx, γ) in enumerate(eachcol(gamma))
