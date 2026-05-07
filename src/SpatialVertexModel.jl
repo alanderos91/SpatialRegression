@@ -130,17 +130,18 @@ end
 
 function eval_loss(triobs::Vector{TriangleObs}, ::Vector{<:AbstractVertexModel}, caches; nchunks::Int = Threads.nthreads())
   cache = caches.logf
-  logl = @localize cache @tasks for T in triobs
+  logl = @tasks for T in triobs
     @set begin
       ntasks = nchunks
       reducer = +
       outputtype = Float64
     end
     triidx = T.triangle # can't use eachtriobs() here due to type instability
+    F = cache[triidx]
     local c = zero(Float64)
     for i in eachobsindex(T)
-      alpha = view(T.A, :, i)
-      logf = view(cache[triidx], :, i)
+      alpha = @get_triple T.A i
+      logf = @get_triple F i
       tmp = weighted_logsumexp(alpha, logf)
       c += tmp
     end
@@ -171,10 +172,10 @@ function update_coefficients!(model, opt, nchunks)
   workspace = ChannelLike(model.caches.workspace)
   workitr = ChannelLike(eachvertex(model))
   @safe_blas begin
-    @localize model opt workspace workitr tforeach(1:nchunks; chunking = false) do _
+    tforeach(1:nchunks; chunking = false) do _
       map(workspace) do wrk
         for v in workitr
-          g = VertexSurrogate(v.index, model, opt.rho)
+          local g = VertexSurrogate(v.index, model, opt.rho)
           if isempty(v.triangles)
             # Case: Incident observation sets are empty
             # Update the coefficients using the penalty term
@@ -200,11 +201,11 @@ function update_dispersion!(model, opt, nchunks)
   workspace = ChannelLike(model.caches.workspace)
   workitr = ChannelLike(eachvertex(model))
   @safe_blas begin
-    @localize model workspace workitr tforeach(1:nchunks; chunking = false) do _
+    tforeach(1:nchunks; chunking = false) do _
       map(workspace) do wrk
         for v in workitr
           if !isempty(v.triangles)
-            g = VertexSurrogate(v.index, model, opt.rho)
+            local g = VertexSurrogate(v.index, model, opt.rho)
             if !isempty(v.triangles)
               mm_update_disp!(v.family, g, v, model.triobs, wrk, model.caches)
             end

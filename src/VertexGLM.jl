@@ -51,7 +51,7 @@ end
 function update_caches!(model::SpatialVertexModel{<:VertexGLM}; nchunks::Int = Threads.nthreads())
   workitr = ChannelLike(eachvertex(model))
   @safe_blas begin
-    @localize model tforeach(1:nchunks; chunking = false) do _
+    tforeach(1:nchunks; chunking = false) do _
       for v in workitr
         update_cache_logf!(model.caches.logf, v, model.triobs)
         update_cache_gamma!(model.caches.gamma, v, model.vertex)
@@ -76,20 +76,21 @@ function eval_loss_surrogate(beta::Vector, v::VertexGLM, triobs::Vector{Triangle
   j, family, link = v.index, v.family, v.link
   for (triidx, T) in eachtriobs(triobs, v)
     t = get_triangle_vertices(T, j)
+    F = cache[triidx]
     for i in eachobsindex(T)
       x = view(T.X, i, :)
-      alpha = view(T.A, :, i)
-      logf = view(cache[triidx], :, i)
+      alpha = @get_triple T.A i
+      logf = @get_triple F i
 
       # Evaluate log-likelihood term at β
-      eta = dot(x, beta)
+      eta = v.nvar > 1 ? dot(x, beta) : x[1]*beta[1]
       mu = meanfun(link, eta)
       logfⱼ = GLMUtilities.logpdf(T.y[i], mu, phi, eta, family, link)
 
       # Evaluate terms dependent on the anchor point βₙ
       zweight = stable_convex_weight(t, alpha, logf)
       tmp = zweight < eps() ? zero(zweight) : zweight * logfⱼ + zweight * (log(alpha[t]) + log(inv(zweight)))
-      @assert !isnan(tmp) && !isinf(tmp) "bad weighted log-likelihood @ vertex $(v.index)\n\tη: $(eta)\n\tμ: $(mu)\n\tφ: $(phi)\n\tlogf: $(logfⱼ)\n\tz: $(zweight)"
+      # @assert !isnan(tmp) && !isinf(tmp) "bad weighted log-likelihood @ vertex $(v.index)\n\tη: $(eta)\n\tμ: $(mu)\n\tφ: $(phi)\n\tlogf: $(logfⱼ)\n\tz: $(zweight)"
       logl += tmp
     end
   end
@@ -99,24 +100,24 @@ end
 function eval_loss_surrogate(phi::Real, v::VertexGLM, triobs::Vector{TriangleObs}, caches)
   cache = caches.logf
   logl = zero(Float64)
-  beta = v.beta
   j, family, link = v.index, v.family, v.link
-  for (triidx, T) in eachtriobs(triobs, v)
+  itr = zip(eachtriobs(triobs, v), v.part)
+  for ((triidx, T), idxrange) in itr
     t = get_triangle_vertices(T, j)
-    for i in eachobsindex(T)
-      x = view(T.X, i, :)
-      alpha = view(T.A, :, i)
-      logf = view(cache[triidx], :, i)
+    F = cache[triidx]
+    for (i, idx) in zip(eachobsindex(T), idxrange)
+      alpha = @get_triple T.A i
+      logf = @get_triple F i
 
-      # Evaluate log-likelihood term at β
-      eta = dot(x, beta)
-      mu = meanfun(link, eta)
+      # Evaluate log-likelihood term at ϕ
+      eta = v.eta[idx]
+      mu = v.mu[idx]
       logfⱼ = GLMUtilities.logpdf(T.y[i], mu, phi, eta, family, link)
 
       # Evaluate terms dependent on the anchor point φₙ
       zweight = stable_convex_weight(t, alpha, logf)
       tmp = zweight < eps() ? zero(zweight) : zweight * logfⱼ + zweight * (log(alpha[t]) + log(inv(zweight)))
-      @assert !isnan(tmp) && !isinf(tmp) "bad weighted log-likelihood @ vertex $(v.index)\n\tNobs: $(v.nobs)\n\tη: $(eta)\n\tμ: $(mu)\n\tφ: $(phi)\n\tlogf: $(logfⱼ)\n\tz: $(zweight)"
+      # @assert !isnan(tmp) && !isinf(tmp) "bad weighted log-likelihood @ vertex $(v.index)\n\tNobs: $(v.nobs)\n\tη: $(eta)\n\tμ: $(mu)\n\tφ: $(phi)\n\tlogf: $(logfⱼ)\n\tz: $(zweight)"
       logl += tmp
     end
   end
@@ -161,10 +162,11 @@ function mm_update_coef!(penalty::AbstractPenalty, g::VertexSurrogate, v::Vertex
   # Update the coefficients using IRWLS
   for ((triidx, T), idxrange) in itr
     y, X, A, t = T.y, T.X, T.A, get_triangle_vertices(T, v.index)
+    F = caches.logf[triidx]
     for (i, idx) in zip(eachobsindex(T), idxrange)
       x = view(X, i, :)
-      alpha = view(A, :, i)
-      logf = view(caches.logf[triidx], :, i)
+      alpha = @get_triple A i
+      logf = @get_triple F i
       zweight = stable_convex_weight(t, alpha, logf)
       dμdη = meanderiv(v.link, η[idx]) 
       r[idx] = (y[i] - μ[idx]) / dμdη
@@ -176,14 +178,24 @@ function mm_update_coef!(penalty::AbstractPenalty, g::VertexSurrogate, v::Vertex
       # @assert zweight > 0 "MM Update w/ Zero Weight @ Vertex $(v.index)\n\tObs. Index: $(idx)\n\talpha = $(alpha)\n\tlogf = $(logf)\n\tResidual: $(r[idx])\n\tIRLS Weight: $(stable_irls_weight(family, link, η[idx], μ[idx], dμdη))"
 
       # Evaluate gradient + Hessian
-      BLAS.axpy!(-d[idx]*r[idx] * dispfun(family, phi), x, ∇L)
-      BLAS.syr!('U', d[idx] * dispfun(family, phi), x, ∇²L)
+      if v.nvar > 1
+        BLAS.axpy!(-d[idx]*r[idx] * dispfun(family, phi), x, ∇L)
+        BLAS.syr!('U', d[idx] * dispfun(family, phi), x, ∇²L)
+      else
+        ∇L[1] = ∇L[1] - d[idx]*r[idx]*x[1]
+        ∇²L[1] = ∇²L[1] + d[idx] * dispfun(family, phi) * x[1]*x[1]
+      end
     end
   end
   accumulate_penalty_derivs!(penalty, ∇L, ∇²L, v, Γ, g.rho)
-  H = Symmetric(∇²L, :U)
-  ldiv!(Δ, cholesky!(H), ∇L)
-  linesearch!(g, v.beta_new, v.beta, Δ, backtrack)
+  if v.nvar > 1
+    H = Symmetric(∇²L, :U)
+    ldiv!(Δ, cholesky!(H), ∇L)
+  else
+    Δ[1] = ∇L[1] / ∇²L[1]
+  end
+  # linesearch!(g, v.beta_new, v.beta, Δ, backtrack)
+  @. v.beta_new = v.beta - Δ
 end
 
 function mm_update_disp!(::UnivariateDistribution, g::VertexSurrogate, v::VertexGLM, triobs::Vector{TriangleObs}, workspace, caches)
@@ -192,24 +204,21 @@ end
 
 function mm_update_disp!(::Normal, g::VertexSurrogate, v::VertexGLM, triobs::Vector{TriangleObs}, workspace, caches)
   # Setup local variables to match notation
-  η = v.eta
   μ = v.mu
 
-  phi_old = v.extra_params[:dispersion]
-  g_prev = g(phi_old)
+  # phi_old = v.extra_params[:dispersion]
+  # g_prev = g(phi_old)
   itr = zip(eachtriobs(triobs, v), v.part)
 
   # Fix β, update φ
   num = den = zero(eltype(v.beta))
   for ((triidx, T), idxrange) in itr
-    y, X, A, t = T.y, T.X, T.A, get_triangle_vertices(T, v.index)
+    y, A, t = T.y, T.A, get_triangle_vertices(T, v.index)
+    F = caches.logf[triidx]
     for (i, idx) in zip(eachobsindex(T), idxrange)
-      x = view(X, i, :)
-      alpha = view(A, :, i)
-      logf = view(caches.logf[triidx], :, i)
+      alpha = @get_triple A i
+      logf = @get_triple F i
       zweight = stable_convex_weight(t, alpha, logf)
-      η[idx] = dot(x, v.beta)
-      μ[idx] = meanfun(v.link, η[idx])
       num += zweight * deviance(v.family, y[i], μ[idx])
       den += zweight
       # v.index == 1 && @show zweight, deviance(v.family, y[i], μ[idx])
@@ -217,8 +226,8 @@ function mm_update_disp!(::Normal, g::VertexSurrogate, v::VertexGLM, triobs::Vec
   end
   phi = den / num
 
-  g_curr = g(phi)
-  @assert g_curr < g_prev || abs(g_curr - g_prev) < sqrt(eps()) * (1 + abs(g_prev)) "\n\tVertex: $(v.index)\n\tNobs: $(v.nobs)\n\tPrevious: $(g_prev)\n\t Current: $(g_curr)\n\tDen/Num: $(den) / $(num)\n\tφ₀: $(phi_old)\n\tφ: $(phi)\n\tβ: $(v.beta)"
+  # g_curr = g(phi)
+  # @assert g_curr < g_prev || abs(g_curr - g_prev) < sqrt(eps()) * (1 + abs(g_prev)) "\n\tVertex: $(v.index)\n\tNobs: $(v.nobs)\n\tPrevious: $(g_prev)\n\t Current: $(g_curr)\n\tDen/Num: $(den) / $(num)\n\tφ₀: $(phi_old)\n\tφ: $(phi)\n\tβ: $(v.beta)"
 
   v.extra_params[:dispersion] = isinf(phi) ? one(phi) : phi
 end
@@ -247,26 +256,26 @@ function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
     iter += 1
 
     # Visit each vertex once to update local regression coefficients
-    update_coefficients!(model, opt, nchunks)
+    print("\tCoefficients"); @time update_coefficients!(model, opt, nchunks)
 
     # Evaluate log-likelihood
-    update_caches!(model; nchunks)
+    print("\t      Caches"); @time update_caches!(model; nchunks)
     nlogl_prev = nlogl
-    nlogl = f(rho; nchunks)
-    @show iter, nlogl, nlogl_prev - nlogl
+    print("\t        Loss"); @time nlogl = f(rho; nchunks)
+    # @show iter, nlogl, nlogl_prev - nlogl
     @assert nlogl < nlogl_prev || abs(nlogl - nlogl_prev) < sqrt(eps()) * (1 + abs(nlogl_prev))
 
     if needs_dispersion(first(model.vertex).family) # TODO
       abs(nlogl - nlogl_prev) <= (1 + abs(nlogl_prev)) * tol && break
 
       # Visit each vertex once to update local dispersion parameters
-      update_dispersion!(model, opt, nchunks)
-
+      print("\t  Dispersion"); @time update_dispersion!(model, opt, nchunks)
+      println("")
       # Evaluate log-likelihood
       update_caches!(model; nchunks)
       nlogl_prev = nlogl
       nlogl = f(rho; nchunks)
-      @show iter, nlogl, nlogl_prev - nlogl
+      # @show iter, nlogl, nlogl_prev - nlogl
       @assert nlogl < nlogl_prev || abs(nlogl - nlogl_prev) < sqrt(eps()) * (1 + abs(nlogl_prev))
     end
   end

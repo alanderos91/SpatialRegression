@@ -103,3 +103,11 @@ function linesearch!(f, βₙ₊₁, βₙ, Δ, backtrack)
   end
   return t
 end
+#
+# MISC
+#
+macro get_triple(A, i)
+  A = esc(A)
+  i = esc(i)
+  return quote ($A[1,$i], $A[2,$i], $A[3,$i]) end
+end

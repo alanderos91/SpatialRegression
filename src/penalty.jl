@@ -72,10 +72,16 @@ function accumulate_penalty_derivs!(::L2Squared, grad, hess, v, gamma, rho)
   beta, weights = v.beta, v.weights
   wsum = sum(weights)
   wrho = 2 * rho
-  BLAS.gemm!('N', 'N', -wrho, gamma, weights, true, grad)
-  BLAS.axpy!(wrho*wsum, beta, grad)
-  @inbounds @simd for k in axes(hess, 2)
-    hess[k,k] += wrho*wsum
+  nvar = length(beta)
+  if nvar > 1
+    BLAS.gemv!('N', -wrho, gamma, weights, true, grad)
+    BLAS.axpy!(wrho*wsum, beta, grad)
+    @inbounds @simd for k in axes(hess, 2)
+      hess[k,k] += wrho*wsum
+    end
+  else
+    grad[1] = grad[1] - wrho*dot(gamma, weights) + wrho*wsum*beta[1]
+    hess[1] = hess[1] + wrho*wsum
   end
 end
 

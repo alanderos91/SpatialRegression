@@ -96,7 +96,7 @@ function _assign_data_to_triangles(tri, id2vertex, S, nchunks)
   cases = ChannelLike(axes(S, 2))
 
   # Build mapping in parallel; don't care about sorting keys or indices yet.
-  tmp = @localize tri id2vertex cases tmap(Dict{TriType,IdxType}, 1:nchunks; chunking = false) do _
+  tmp = tmap(Dict{TriType,IdxType}, 1:nchunks; chunking = false) do _
     local tri2idx = Dict{TriType,IdxType}()
     for i in cases
       # Check whether i-th case lies inside any triangle of the mesh
