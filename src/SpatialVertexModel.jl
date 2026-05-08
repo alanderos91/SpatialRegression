@@ -125,7 +125,8 @@ end
 function (f::SpatialVertexModel)(rho; kwargs...)
   loss = eval_loss(f.triobs, f.vertex, f.caches; kwargs...)
   penalty = eval_penalty(f.penalty, f.vertex)
-  return loss + rho*penalty
+  prior_loss = eval_prior_loss(f.vertex; kwargs...)
+  return loss + rho*penalty + prior_loss
 end
 
 function eval_loss(triobs::Vector{TriangleObs}, ::Vector{<:AbstractVertexModel}, caches; nchunks::Int = Threads.nthreads())
@@ -163,7 +164,8 @@ function (g::VertexSurrogate)(beta)
   v = g.model.vertex[j]
   loss = eval_loss_surrogate(beta, v, g.model.triobs, g.model.caches)
   penalty = eval_penalty_surrogate(g.model.penalty, beta, v.weights, g.model.caches.gamma[j], v.beta)
-  return loss + g.rho*penalty
+  log_prior = eval_log_prior_vertex(beta, v)
+  return loss + g.rho*penalty - log_prior
 end
 #
 # ESTIMATION
@@ -204,12 +206,8 @@ function update_dispersion!(model, opt, nchunks)
     tforeach(1:nchunks; chunking = false) do _
       map(workspace) do wrk
         for v in workitr
-          if !isempty(v.triangles)
-            local g = VertexSurrogate(v.index, model, opt.rho)
-            if !isempty(v.triangles)
-              mm_update_disp!(v.family, g, v, model.triobs, wrk, model.caches)
-            end
-          end
+          local g = VertexSurrogate(v.index, model, opt.rho)
+          mm_update_disp!(v.family, g, v, model.triobs, wrk, model.caches)
         end
       end
     end

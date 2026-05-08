@@ -20,14 +20,22 @@ end
 
 infer_vertex_type(::Type{VertexGLM}, ::D, ::L; kwargs...) where {D <: UnivariateDistribution, L <: Link} = VertexGLM{D,L}
 
-function create_vertex(::Type{VertexGLM{D,L}}, index, part, triangles, neighbors, weights, nobs, nvar; family::D=Normal(), link::L=IdentityLink(), kwargs...) where {D <: UnivariateDistribution, L <: Link}
+function create_vertex(::Type{VertexGLM{D,L}}, index, part, triangles, neighbors, weights, nobs, nvar;
+  family::D = Normal(),
+  link::L   = IdentityLink(),
+  nu::Real  = 2, 
+  kwargs...) where {D <: UnivariateDistribution, L <: Link}
   d = zeros(nobs)
   beta = zeros(nvar)
   beta_new = similar(beta)
   eta = zeros(nobs)
   mu = zeros(nobs)
   workres = zeros(nobs)
-  extra_params = Dict(:dispersion => 1.0)
+  extra_params = Dict(
+    :dispersion => 1.0,
+    :global_dispersion => 1.0,
+    :nu => float(nu),
+  )
   return VertexGLM(
     index, part, triangles, neighbors, weights,
     nobs, nvar, family, link, d, beta, beta_new,
@@ -65,6 +73,32 @@ function update_caches_serial!(model::SpatialVertexModel{<:VertexGLM})
     update_cache_logf!(model.caches.logf, v, model.triobs)
     update_cache_gamma!(model.caches.gamma, v, model.vertex)
   end
+end
+
+eval_log_prior_vertex(::Vector, v::VertexGLM) = eval_log_prior_vertex(v.extra_params[:dispersion], v)
+
+function eval_log_prior_vertex(phi::Real, v::VertexGLM)
+  # assumes conjugancy with Gaussian-like distribution
+  nu = v.extra_params[:nu]
+  phi0 = v.extra_params[:global_dispersion]
+  Distributions.logpdf(Distributions.Gamma(nu/2+1, 2*phi0/nu), phi)
+end
+
+function eval_prior_loss(vertex::Vector{V}; nchunks::Int = Threads.nthreads()) where V <: VertexGLM
+  if needs_dispersion(first(vertex).family)
+    logl = @tasks for v in vertex
+      @set begin
+        ntasks = nchunks
+        reducer = +
+        outputtype = Float64
+      end
+      local phi = v.extra_params[:dispersion]
+      eval_log_prior_vertex(phi, v)
+    end
+  else
+    logl = 0.0
+  end
+  return -logl
 end
 #
 # SURROGATE
@@ -206,8 +240,6 @@ function mm_update_disp!(::Normal, g::VertexSurrogate, v::VertexGLM, triobs::Vec
   # Setup local variables to match notation
   μ = v.mu
 
-  # phi_old = v.extra_params[:dispersion]
-  # g_prev = g(phi_old)
   itr = zip(eachtriobs(triobs, v), v.part)
 
   # Fix β, update φ
@@ -224,12 +256,29 @@ function mm_update_disp!(::Normal, g::VertexSurrogate, v::VertexGLM, triobs::Vec
       # v.index == 1 && @show zweight, deviance(v.family, y[i], μ[idx])
     end
   end
-  phi = den / num
+  phi0 = v.extra_params[:global_dispersion]
+  nu = v.extra_params[:nu]
+  if !isempty(v.triangles)
+    phi = (den + nu) / (num + nu / phi0)
+  else
+    phi = phi0
+  end
 
   # g_curr = g(phi)
   # @assert g_curr < g_prev || abs(g_curr - g_prev) < sqrt(eps()) * (1 + abs(g_prev)) "\n\tVertex: $(v.index)\n\tNobs: $(v.nobs)\n\tPrevious: $(g_prev)\n\t Current: $(g_curr)\n\tDen/Num: $(den) / $(num)\n\tφ₀: $(phi_old)\n\tφ: $(phi)\n\tβ: $(v.beta)"
 
   v.extra_params[:dispersion] = isinf(phi) ? one(phi) : phi
+end
+
+function update_pooling!(model)
+  J, phi0 = length(model.vertex), 0.0
+  for v in eachvertex(model)
+    nu = v.extra_params[:nu]
+    phi0 += 1/J * nu/(nu+2) * v.extra_params[:dispersion]
+  end
+  for v in eachvertex(model)
+    v.extra_params[:global_dispersion] = phi0
+  end
 end
 
 function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
@@ -256,28 +305,18 @@ function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
     iter += 1
 
     # Visit each vertex once to update local regression coefficients
-    print("\tCoefficients"); @time update_coefficients!(model, opt, nchunks)
-
-    # Evaluate log-likelihood
-    print("\t      Caches"); @time update_caches!(model; nchunks)
-    nlogl_prev = nlogl
-    print("\t        Loss"); @time nlogl = f(rho; nchunks)
-    # @show iter, nlogl, nlogl_prev - nlogl
-    @assert nlogl < nlogl_prev || abs(nlogl - nlogl_prev) < sqrt(eps()) * (1 + abs(nlogl_prev))
+    update_coefficients!(model, opt, nchunks)
 
     if needs_dispersion(first(model.vertex).family) # TODO
-      abs(nlogl - nlogl_prev) <= (1 + abs(nlogl_prev)) * tol && break
-
       # Visit each vertex once to update local dispersion parameters
-      print("\t  Dispersion"); @time update_dispersion!(model, opt, nchunks)
-      println("")
-      # Evaluate log-likelihood
-      update_caches!(model; nchunks)
-      nlogl_prev = nlogl
-      nlogl = f(rho; nchunks)
-      # @show iter, nlogl, nlogl_prev - nlogl
-      @assert nlogl < nlogl_prev || abs(nlogl - nlogl_prev) < sqrt(eps()) * (1 + abs(nlogl_prev))
+      update_dispersion!(model, opt, nchunks)
+      update_pooling!(model)
     end
+    update_caches!(model; nchunks)
+    nlogl_prev = nlogl
+    nlogl = f(rho; nchunks)
+    @show iter, nlogl, nlogl_prev - nlogl
+    @assert nlogl < nlogl_prev || abs(nlogl - nlogl_prev) < sqrt(eps()) * (1 + abs(nlogl_prev))
   end
 
   # Apply all updates
