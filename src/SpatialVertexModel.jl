@@ -129,7 +129,7 @@ function (f::SpatialVertexModel)(rho; kwargs...)
   return loss + rho*penalty + prior_loss
 end
 
-function eval_loss(triobs::Vector{TriangleObs}, ::Vector{<:AbstractVertexModel}, caches; nchunks::Int = Threads.nthreads())
+function eval_loss(triobs::Vector{TriangleObs}, ::Vector{<:AbstractVertexModel}, caches; nchunks::Int = Threads.nthreads(), kwargs...)
   cache = caches.logf
   logl = @tasks for T in triobs
     @set begin
@@ -159,12 +159,12 @@ struct VertexSurrogate{V <: AbstractVertexModel, P <: AbstractPenalty, C}
   rho::Float64
 end
 
-function (g::VertexSurrogate)(beta)
+function (g::VertexSurrogate)(beta; kwargs...)
   j = g.index
   v = g.model.vertex[j]
   loss = eval_loss_surrogate(beta, v, g.model.triobs, g.model.caches)
   penalty = eval_penalty_surrogate(g.model.penalty, beta, v.weights, g.model.caches.gamma[j], v.beta)
-  log_prior = eval_log_prior_vertex(beta, v)
+  log_prior = eval_log_prior_vertex(beta, v; kwargs...)
   return loss + g.rho*penalty - log_prior
 end
 #
@@ -199,7 +199,7 @@ function update_coefficients!(model, opt, nchunks)
   return nothing
 end
 
-function update_dispersion!(model, opt, nchunks)
+function update_dispersion!(model, opt, nchunks, use_prior)
   workspace = ChannelLike(model.caches.workspace)
   workitr = ChannelLike(eachvertex(model))
   @safe_blas begin
@@ -207,7 +207,7 @@ function update_dispersion!(model, opt, nchunks)
       map(workspace) do wrk
         for v in workitr
           local g = VertexSurrogate(v.index, model, opt.rho)
-          mm_update_disp!(v.family, g, v, model.triobs, wrk, model.caches)
+          mm_update_disp!(v.family, g, v, model.triobs, wrk, model.caches, use_prior)
         end
       end
     end
