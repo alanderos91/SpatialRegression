@@ -106,7 +106,7 @@ function update_cache_logf!(cache, v::AbstractVertexModel, triobs::Vector{Triang
 end
 
 function init_cache_gamma(vertex, nvar)
-  return Dict(v.index => zeros(nvar, length(v.neighbors)) for v in vertex)
+  return [zeros(nvar, length(v.neighbors)) for v in vertex]
 end
 
 function update_cache_gamma!(cache, v::V, vertex::Vector{V}) where V <: AbstractVertexModel
