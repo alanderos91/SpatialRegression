@@ -3,3 +3,4 @@ Manifest.toml
 examples/data
 examples/figures/*.*
 examples/tables/*.*
+dev/
