@@ -31,6 +31,7 @@ abstract type AbstractSpatialModel end
 include("TriangleObs.jl")
 include("SpatialVertexModel.jl")
 include("VertexGLM.jl")
+include("VertexQREG.jl")
 export TriangleObs,
   VertexGLM,
   SpatialVertexModel

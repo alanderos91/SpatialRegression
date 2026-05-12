@@ -18,7 +18,7 @@ using DelaunayTriangulation
 using SpatialRegression
 using CairoMakie
 using DataFrames, PrettyTables
-using SpatialRegression: L2Squared, L1Approx
+using SpatialRegression: L2Squared, L1Approx, AsymmetricLaplace, ALD
 
 function equilateral_refinement(Δ, max_area)
   Δnew = refine!(deepcopy(Δ),
@@ -51,6 +51,8 @@ function simulate_data(n, p, Δ, family, link)
   end
   if family isa Normal
     Φ = rand(1*Beta(2.0, 5.0), length(vertices))
+  elseif family isa AsymmetricLaplace
+    Φ = rand(1*Beta(2.0, 10.0), length(vertices))
   else
     Φ = ones(length(vertices))
   end

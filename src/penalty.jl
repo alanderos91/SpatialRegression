@@ -102,6 +102,38 @@ function accumulate_penalty_derivs!(p::L1Approx, grad, hess, v, gamma, rho)
   end
 end
 
+function accumulate_penalty_terms!(::L2Squared, RHS, LHS, v, gamma, rho)
+  beta, weights = v.beta, v.weights
+  wsum = sum(weights)
+  wrho = 2 * rho
+  nvar = length(beta)
+  if nvar > 1
+    BLAS.gemv!('N', wrho, gamma, weights, true, RHS)
+    @inbounds @simd for k in axes(LHS, 2)
+      LHS[k,k] += wrho*wsum
+    end
+  else
+    RHS[1] = RHS[1] + wrho*dot(gamma, weights)
+    LHS[1] = LHS[1] + wrho*wsum
+  end
+end
+
+function accumulate_penalty_terms!(p::L1Approx, RHS, LHS, v, gamma, rho)
+  beta, weights = v.beta, v.weights
+  epsilon = p.epsilon
+  for k in eachindex(beta)
+    c, d = zero(Float64), zero(Float64)
+    for (idx, γ) in enumerate(eachcol(gamma))
+      eta = beta[k] - γ[k]
+      q = l1apx(eta, epsilon/2)
+      c += weights[idx] / q
+      d += γ[k] * weights[idx] / q
+    end
+    RHS[k] += rho*d
+    LHS[k,k] += rho*c
+  end
+end
+
 function update_empty_case!(::L2Squared, v, weights, caches)
   gamma = caches.gamma[v.index]
   mul!(v.beta_new, gamma, weights)
