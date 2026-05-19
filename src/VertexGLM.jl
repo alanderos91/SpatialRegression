@@ -86,13 +86,8 @@ function eval_log_prior_vertex(phi::Real, v::VertexGLM; use_prior::Bool = false)
   else
     # convex log penalty on ratios; flipped signed!
     nu = v.extra_params[:nu]
-    wsum = sum(v.weights)
-    penalty = zero(Float64)
-    for (idx, k) in enumerate(v.neighbors)
-      phi_k = v.extra_params[:dispersion]
-      penalty -= 1//2 * nu * v.weights[idx]/wsum * log(phi / phi_k)
-    end
-    penalty
+    A = v.extra_params[:local_dispersion]
+    nu * 1//2 * log(phi / A)
   end
 end
 
@@ -280,8 +275,14 @@ function mm_update_disp!(::Normal, g::VertexSurrogate, v::VertexGLM, triobs::Vec
   else
     nu = v.extra_params[:nu]
     A = iszero(den) ? zero(den) : num / den
-    B = v.extra_params[:local_dispersion] # ∑ w_jk / ϕ_k
-    C = nu# * sum(v.weights)
+    B = zero(den)
+    C = nu
+    wsum = sum(v.weights)
+    for (idx, k) in enumerate(v.neighbors)
+      u = g.model.vertex[k]
+      B_k = u.extra_params[:local_dispersion]
+      B += v.weights[idx]/wsum * inv(B_k)
+    end
     invphi = den / (den + C) * A + C / (den + C) * B
     phi = inv(invphi)
   end
@@ -302,6 +303,17 @@ function update_pooling!(model, use_prior)
     for v in eachvertex(model)
       v.extra_params[:global_dispersion] = phi0
     end
+  else
+    for v in eachvertex(model)
+      wavg = zero(Float64)
+      wsum = sum(v.weights)
+      for (idx, k) in enumerate(v.neighbors)
+        u = model.vertex[k]
+        phi_k = u.extra_params[:dispersion]
+        wavg += v.weights[idx]/wsum * phi_k
+      end
+      v.extra_params[:local_dispersion] = wavg
+    end
   end
 end
 
@@ -320,8 +332,10 @@ function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
   # Initialize
   VT = infer_vertex_type(VertexGLM, family, link; kwargs...)
   model = f = create_model(VT, yfull, Xfull, Sfull, tri; nchunks, family, link, kwargs...)
+  update_phi = needs_dispersion(family)
   initialize_coefficients!(model.triobs, model.vertex)
   update_caches!(model; nchunks)
+  update_phi && update_pooling!(model, use_prior)
   nlogl = f(rho; nchunks, use_prior)
   nlogl_prev = zero(nlogl)
   iter = 0
@@ -331,25 +345,14 @@ function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
 
     # Visit each vertex once to update local regression coefficients
     update_coefficients!(model, opt, nchunks)
+    update_phi && update_caches!(model; nchunks)
 
-    if needs_dispersion(first(model.vertex).family) # TODO
-      # Visit each vertex once to update local dispersion parameters
-      if ! use_prior
-        for v in eachvertex(model)
-          wavg = zero(Float64)
-          wsum = sum(v.weights)
-          for (idx, k) in enumerate(v.neighbors)
-            u = model.vertex[k]
-            phi_k = u.extra_params[:dispersion]
-            wavg += v.weights[idx]/wsum/phi_k
-          end
-          v.extra_params[:local_dispersion] = wavg
-        end
-      end
-      update_dispersion!(model, opt, nchunks, use_prior)
-      update_pooling!(model, use_prior)
-    end
+    # Visit each vertex once to update auxiliary parameters
+    update_phi && update_dispersion!(model, opt, nchunks, use_prior)
+
+    # Synchronize algorithm state and evaluate current model
     update_caches!(model; nchunks)
+    update_phi && update_pooling!(model, use_prior)
     nlogl_prev = nlogl
     nlogl = f(rho; nchunks, use_prior)
     @show iter, nlogl, nlogl_prev - nlogl
@@ -357,8 +360,8 @@ function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
   end
 
   # Apply all updates
-  for v in eachvertex(model)
-    if needs_dispersion(v.family)
+  if update_phi
+    for v in eachvertex(model)
       phi = v.extra_params[:dispersion]
       v.extra_params[:dispersion] = 1 / phi
     end
