@@ -34,7 +34,6 @@ function create_vertex_set(
 
     # determine the number of incident vertices
     neighbors = [id2vertex[u] for u in DelaunayTriangulation.iterated_neighbourhood(tri, id, 1)]
-    sort!(neighbors)
     nneighbors = length(neighbors)
 
     # initialize weights
@@ -153,19 +152,36 @@ end
 #
 # SURROGATE
 #
-struct VertexSurrogate{V <: AbstractVertexModel, P <: AbstractPenalty, C}
+struct CoefficientSurrogate{V <: AbstractVertexModel, P <: AbstractPenalty, C}
   index::Int
   model::SpatialVertexModel{V,P,C}
   rho::Float64
+  use_prior::Bool
 end
 
-function (g::VertexSurrogate)(beta; kwargs...)
+function (g::CoefficientSurrogate)(beta)
   j = g.index
   v = g.model.vertex[j]
   loss = eval_loss_surrogate(beta, v, g.model.triobs, g.model.caches)
   penalty = eval_penalty_surrogate(g.model.penalty, beta, v.weights, g.model.caches.gamma[j], v.beta)
-  log_prior = eval_log_prior_vertex(beta, v; kwargs...)
+  log_prior = eval_log_prior_vertex(v.extra_params[:dispersion], v, use_prior = g.use_prior)
   return loss + g.rho*penalty - log_prior
+end
+
+struct DispersionSurrogate{V <: AbstractVertexModel, P <: AbstractPenalty, C}
+  index::Int
+  model::SpatialVertexModel{V,P,C}
+  rho::Float64
+  use_prior::Bool
+end
+
+function (g::DispersionSurrogate)(phi)
+  j = g.index
+  v = g.model.vertex[j]
+  loss = eval_loss_surrogate(phi, v, g.model.triobs, g.model.caches)
+  penalty = eval_penalty_surrogate(g.model.penalty, v.beta, v.weights, g.model.caches.gamma[j], v.beta)
+  log_prior = eval_prior_surrogate(phi, v, g.model.vertex, g.use_prior)
+  return loss + g.rho*penalty + log_prior
 end
 #
 # ESTIMATION
@@ -177,7 +193,7 @@ function update_coefficients!(model, opt, nchunks)
     tforeach(1:nchunks; chunking = false) do _
       map(workspace) do wrk
         for v in workitr
-          local g = VertexSurrogate(v.index, model, opt.rho)
+          local g = CoefficientSurrogate(v.index, model, opt.rho, opt.use_prior)
           if isempty(v.triangles)
             # Case: Incident observation sets are empty
             # Update the coefficients using the penalty term
@@ -199,15 +215,15 @@ function update_coefficients!(model, opt, nchunks)
   return nothing
 end
 
-function update_dispersion!(model, opt, nchunks, use_prior)
+function update_dispersion!(model, opt, nchunks)
   workspace = ChannelLike(model.caches.workspace)
   workitr = ChannelLike(eachvertex(model))
   @safe_blas begin
     tforeach(1:nchunks; chunking = false) do _
       map(workspace) do wrk
         for v in workitr
-          local g = VertexSurrogate(v.index, model, opt.rho)
-          mm_update_disp!(v.family, g, v, model.triobs, wrk, model.caches, use_prior)
+          local g = DispersionSurrogate(v.index, model, opt.rho, opt.use_prior)
+          mm_update_disp!(v.family, g, v, model.triobs, wrk, model.caches)
         end
       end
     end

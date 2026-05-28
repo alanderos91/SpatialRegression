@@ -81,25 +81,28 @@ end
 
 is_inside_mesh(Δ::Triangulation) = Base.Fix1(is_inside_mesh, Δ)
 #
-# LINESEARCH
+# DESCENT + LINESEARCH
 #
+function is_approx_decrease(f_new, f_old, rtol)
+  return f_new <= f_old || isapprox(f_new, f_old, rtol = rtol)
+end
+
 function linesearch!(f, βₙ₊₁, βₙ, Δ, backtrack)
   # Backtracking line search
   t = 1.0
   objective = f(βₙ)
   for step in 0:backtrack
     @. βₙ₊₁ = βₙ - t * Δ
-    # objective_new = f(βₙ₊₁)
-    # if (objective_new <= objective + objective_new * 1e-6) || isapprox(objective_new, objective, atol = sqrt(eps()))
-    #   break
-    # elseif step < backtrack
-    #   t /= 2
-    # else
-    #   @warn("Backtracking failed after $(step) attempts!")
-    #   @. βₙ₊₁ = βₙ
-    #   break
-    # end
-    break
+    objective_new = f(βₙ₊₁)
+    if is_approx_decrease(objective_new, objective, sqrt(eps()))
+      break
+    elseif step < backtrack
+      t /= 2
+    else
+      @warn("Backtracking failed after $(step) attempts!")
+      @. βₙ₊₁ = βₙ
+      break
+    end
   end
   return t
 end

@@ -49,7 +49,7 @@ end
 #
 # UPDATES
 #
-function mm_update_coef!(penalty::AbstractPenalty, g::VertexSurrogate, v::VertexGLM{<:ALD}, triobs::Vector{TriangleObs}, workspace, caches, opt)
+function mm_update_coef!(penalty::AbstractPenalty, g::CoefficientSurrogate, v::VertexGLM{<:ALD}, triobs::Vector{TriangleObs}, workspace, caches, opt)
 # Setup local variables to match notation
   Γ = caches.gamma[v.index]
   d = v.d
@@ -103,7 +103,7 @@ function mm_update_coef!(penalty::AbstractPenalty, g::VertexSurrogate, v::Vertex
   @. v.beta_new = v.beta - Δ
 end
 
-function mm_update_disp!(::ALD, g::VertexSurrogate, v::VertexGLM, triobs::Vector{TriangleObs}, workspace, caches, use_prior)
+function mm_update_disp!(::ALD, g::DispersionSurrogate, v::VertexGLM, triobs::Vector{TriangleObs}, workspace, caches)
   # Setup local variables to match notation
   μ = v.mu
 
@@ -124,7 +124,7 @@ function mm_update_disp!(::ALD, g::VertexSurrogate, v::VertexGLM, triobs::Vector
     end
   end
 
-  if use_prior
+  if g.use_prior
     phi0 = v.extra_params[:global_dispersion]
     nu = v.extra_params[:nu]
     if !isempty(v.triangles)
@@ -134,19 +134,17 @@ function mm_update_disp!(::ALD, g::VertexSurrogate, v::VertexGLM, triobs::Vector
     end
   else
     nu = v.extra_params[:nu]
-    A = iszero(den) ? zero(den) : num / den
     B = zero(den)
-    C = nu
-    wsum = sum(v.weights)
     for (idx, k) in enumerate(v.neighbors)
       u = g.model.vertex[k]
       B_k = u.extra_params[:local_dispersion]
-      B += v.weights[idx]/wsum * inv(B_k)
+      B += v.weights[idx] * inv(B_k)
     end
-    invphi = den / (den + C) * A + C / (den + C) * B
-    phi = inv(invphi)
+    phi = (den + nu) / (num + nu * B)
   end
 
+  # phi_old = v.extra_params[:dispersion]
+  # g_prev = g(phi_old)
   # g_curr = g(phi)
   # @assert g_curr < g_prev || abs(g_curr - g_prev) < sqrt(eps()) * (1 + abs(g_prev)) "\n\tVertex: $(v.index)\n\tNobs: $(v.nobs)\n\tPrevious: $(g_prev)\n\t Current: $(g_curr)\n\tDen/Num: $(den) / $(num)\n\tφ₀: $(phi_old)\n\tφ: $(phi)\n\tβ: $(v.beta)"
 
@@ -175,26 +173,33 @@ function fitqreg(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
   # initialize_coefficients!(model.triobs, model.vertex)
   update_caches!(model; nchunks)
   update_phi && update_pooling!(model, use_prior)
+
+  # Main loop
   nlogl = f(rho; nchunks, use_prior)
   nlogl_prev = zero(nlogl)
   iter = 0
   xi = smooth_max
-  opt = (; rho = rho, xi = xi)
+  opt = (; rho = rho, xi = xi, use_prior = use_prior)
   while iter < maxiter && abs(nlogl - nlogl_prev) > (1 + abs(nlogl_prev)) * tol
     iter += 1
 
     # Visit each vertex once to update local regression coefficients
     update_coefficients!(model, opt, nchunks)
-    opt = (; rho = rho, xi = xi)
-    xi = iter > smooth_itr ? smooth_min : smooth_max * (smooth_min / smooth_max) ^ (iter / smooth_itr)
-    update_phi && update_dispersion!(model, opt, nchunks, use_prior)
+    
+    # Visit each vertex once to update auxiliary parameters
+    update_phi && update_dispersion!(model, opt, nchunks)
 
+    # Synchronize algorithm state and evaluate current model
+    xi = iter > smooth_itr ? smooth_min : smooth_max * (smooth_min / smooth_max) ^ (iter / smooth_itr)
+    opt = (; rho = rho, xi = xi, use_prior = use_prior)
     update_caches!(model; nchunks)
     update_phi && update_pooling!(model, use_prior)
+
+    # Check convergence
     nlogl_prev = nlogl
     nlogl = f(rho; nchunks, use_prior)
     @show iter, nlogl, nlogl_prev - nlogl
-    @assert nlogl < nlogl_prev || abs(nlogl - nlogl_prev) < sqrt(eps()) * (1 + abs(nlogl_prev))
+    @assert is_approx_decrease(nlogl, nlogl_prev, sqrt(eps()))
   end
 
   # Apply all updates
