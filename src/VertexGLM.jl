@@ -78,16 +78,20 @@ end
 eval_log_prior_vertex(::Vector, v::VertexGLM; kwargs...) = eval_log_prior_vertex(v.extra_params[:dispersion], v; kwargs...)
 
 function eval_log_prior_vertex(phi::Real, v::VertexGLM; use_prior::Bool = false)
-  if use_prior
-    # assumes conjugancy with Gaussian-like distribution
-    nu = v.extra_params[:nu]
-    phi0 = v.extra_params[:global_dispersion]
-    Distributions.logpdf(Distributions.Gamma(nu/2+1, 2*phi0/nu), phi)
+  if needs_dispersion(v.family)
+    if use_prior
+      # assumes conjugancy with Gaussian-like distribution
+      nu = v.extra_params[:nu]
+      phi0 = v.extra_params[:global_dispersion]
+      Distributions.logpdf(Distributions.Gamma(nu/2+1, 2*phi0/nu), phi)
+    else
+      # convex log penalty on ratios; flipped signed!
+      nu = v.extra_params[:nu]
+      A = v.extra_params[:local_dispersion]
+      nu * 1//2 * log(phi / A)
+    end
   else
-    # convex log penalty on ratios; flipped signed!
-    nu = v.extra_params[:nu]
-    A = v.extra_params[:local_dispersion]
-    nu * 1//2 * log(phi / A)
+    zero(phi)
   end
 end
 
@@ -166,21 +170,25 @@ function eval_loss_surrogate(phi::Real, v::VertexGLM, triobs::Vector{TriangleObs
 end
 
 function eval_prior_surrogate(phi::Real, v::VertexGLM, vertex, use_prior)
-  if use_prior
-    # assumes conjugancy with Gaussian-like distribution
-    nu = v.extra_params[:nu]
-    phi0 = v.extra_params[:global_dispersion]
-    Distributions.logpdf(Distributions.Gamma(nu/2+1, 2*phi0/nu), phi)
-  else
-    # convex log penalty on ratios; flipped signed!
-    nu = v.extra_params[:nu]
-    A_j = v.extra_params[:local_dispersion]
-    B_j = 0.0
-    for (idx, k) in enumerate(v.neighbors)
-      u = vertex[k]
-      B_j += v.weights[idx] / u.extra_params[:local_dispersion]
+  if needs_dispersion(v.family)
+    if use_prior
+      # assumes conjugancy with Gaussian-like distribution
+      nu = v.extra_params[:nu]
+      phi0 = v.extra_params[:global_dispersion]
+      Distributions.logpdf(Distributions.Gamma(nu/2+1, 2*phi0/nu), phi)
+    else
+      # convex log penalty on ratios; flipped signed!
+      nu = v.extra_params[:nu]
+      A_j = v.extra_params[:local_dispersion]
+      B_j = 0.0
+      for (idx, k) in enumerate(v.neighbors)
+        u = vertex[k]
+        B_j += v.weights[idx] / u.extra_params[:local_dispersion]
+      end
+      return nu * 1//2 * (-log(phi / A_j) + phi * B_j - 1)
     end
-    return nu * 1//2 * (-log(phi / A_j) + phi * B_j - 1)
+  else
+    zero(phi)
   end
 end
 #
@@ -341,6 +349,7 @@ function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
     rho::Real = 1.0,
     nchunks::Int = Threads.nthreads(),
     use_prior::Bool = false,
+    verbose::Bool = false,
     kwargs...
     # intercept = all(isequal(1), view(Xfull, :, 1)),
   ) where {D <: UnivariateDistribution, L <: Link}
@@ -373,7 +382,7 @@ function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
     # Check convergence
     nlogl_prev = nlogl
     nlogl = f(rho; nchunks, use_prior)
-    @show iter, nlogl, nlogl_prev - nlogl
+    verbose && @show iter, nlogl, nlogl_prev - nlogl
     @assert is_approx_decrease(nlogl, nlogl_prev, sqrt(eps()))
   end
 

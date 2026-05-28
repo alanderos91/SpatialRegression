@@ -161,6 +161,7 @@ function fitqreg(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
     smooth_itr::Real = 20,
     nchunks::Int = Threads.nthreads(),
     use_prior::Bool = false,
+    verbose::Bool = false,
     kwargs...
     # intercept = all(isequal(1), view(Xfull, :, 1)),
   )
@@ -198,7 +199,7 @@ function fitqreg(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
     # Check convergence
     nlogl_prev = nlogl
     nlogl = f(rho; nchunks, use_prior)
-    @show iter, nlogl, nlogl_prev - nlogl
+    verbose && @show iter, nlogl, nlogl_prev - nlogl
     @assert is_approx_decrease(nlogl, nlogl_prev, sqrt(eps()))
   end
 
