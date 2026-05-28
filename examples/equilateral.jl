@@ -18,6 +18,7 @@ using DelaunayTriangulation
 using SpatialRegression
 using CairoMakie
 using DataFrames, PrettyTables
+using JLD2
 using SpatialRegression: L2Squared, L1Approx, AsymmetricLaplace, ALD
 
 function equilateral_refinement(Δ, max_area)
@@ -79,134 +80,9 @@ function simulate_data(n, p, Δ, family, link)
   end
   return y, X, S, B, Φ, H
 end
-
 #
 # TRIANGULATIONS
 #
-function get_tri_title(Δ)
-  stats = statistics(Δ)
-  return "$(stats.num_solid_triangles) triangles, $(stats.num_solid_vertices) vertices"
-end
-
-#
-# PLOTS
-#
-function plot_fitted(instances; markersize = 4.0, kwargs...)
-  local W = 400; H = 250
-  local NROW = 2; NSCENARIO = length(instances)
-
-  # Initialize figure with column labels
-  fig = Figure(size = (W * NSCENARIO, H * NROW))
-  Label(fig[2,1], "Observed", font = :bold, rotation = pi/2, tellheight = false)
-  Label(fig[3,1], "Predicted", font = :bold, rotation = pi/2, tellheight = false)
-  cr = Observable((0.0, 1.0))
-  for (j, prob) in enumerate(instances)
-    # Retrieve information about the instance
-    y, yhat, Δ, S = prob.response, prob.prediction, prob.triangulation, prob.location
-
-    # Update minimum and maximum values for color scale
-    cr[] = (min(minimum(y), minimum(yhat)), max(maximum(y), maximum(yhat)))
-
-    # Add a row label with triangulation characteristics
-    Label(fig[1,1+j], get_tri_title(Δ), font = :bold, tellwidth = false)
-
-    # Add a panel for observed data
-    ax = Axis(fig[2,1+j])
-    scatter!(ax, S[1,:], S[2,:]; color = y, colorrange = cr, markersize, kwargs...)
-
-    # Predicted
-    ax = Axis(fig[3,1+j])
-    scatter!(ax, S[1,:], S[2,:]; color = yhat, colorrange = cr, markersize, kwargs...)
-  end
-  Colorbar(fig[2:3, 2+NSCENARIO], colorrange = cr, vertical = true)
-  return fig
-end
-
-#
-# MISC
-#
-function init_table()
-  return DataFrame(
-    family = String[],
-    vertices = Int[],
-    triangles = Int[],
-    niter = Int[],
-    objective = Float64[],
-    time = Float64[],
-    rmse_beta = Float64[],
-    rmse_resp = Float64[],
-  )
-end
-
-function run_benchmark!(generate_data, results, Δ, family, link, seed, rho, penalty)
-  # Sample from data generating function
-  Random.seed!(seed)
-  local y, X, S, B0 = generate_data(Δ)
-  BACKTRACK = 100
-  TOL = 1e-6
-
-  # Precompile
-  @timed SpatialRegression.fitmodel(VertexGLM, y, X, S, Δ;
-    family = family,
-    link = link,
-    penalty = penalty,
-    rho = rho,
-    tol = TOL,
-    backtrack = BACKTRACK,
-    maxiter = 10,
-    nchunks = Threads.nthreads()
-  )
-
-  # Fit a model with our MM algorithm
-  timed_result = @timed SpatialRegression.fitmodel(VertexGLM, y, X, S, Δ;
-    family = family,
-    link = link,
-    penalty = penalty,
-    rho = rho,
-    tol = TOL,
-    backtrack = BACKTRACK,
-    maxiter = 10^3,
-    nchunks = Threads.nthreads()
-  )
-
-  # Collect results and write to DataFrame
-  stats = statistics(Δ)
-  niter, m, logl = timed_result.value
-  timing = timed_result.time  
-  B = hcat([v.beta for v in m.vertex]...)
-  yhat = SpatialRegression.predict(X, S, m.vertex, Δ)
-  rmse_beta = sqrt(mean(abs2, B - B0))
-  rmse_resp = sqrt(mean(abs2, y - yhat))
-  push!(results,
-    (
-      family |> typeof |> nameof |> string,
-      length(m.vertex), stats.num_solid_triangles, 
-      niter, logl, timing, rmse_beta, rmse_resp
-    )
-  )
-
-  # Return information about this instance
-  info = (;
-    response = y,
-    features = X,
-    location = S,
-    triangulation = Δ,
-    prediction = yhat,
-    niter, logl, timing, rmse_beta, rmse_resp,
-  )
-  return info
-end
-
-function run_benchmarks(scenario, seed)
-  results = init_table()
-  instances = NamedTuple[]
-  for Δ in scenario.triangulations
-    prob = run_benchmark!(scenario.data, results, Δ, scenario.family, scenario.link, seed, scenario.rho, scenario.penalty)
-    push!(instances, prob)
-  end
-  return results, instances
-end
-
 function default_equilateral_domain()
   # Vertices of equilateral triangle centered at (0, 0), inscribed in unit circle
   # Create boundary points of triangle area; use CCW orientation
@@ -215,6 +91,11 @@ end
 
 function init_triangulation(boundary_points = default_equilateral_domain())
   triangulate_convex(boundary_points, [1, 2, 3]; delete_ghosts = false)
+end
+
+function mesh_identifier(Δ)
+  stats = statistics(Δ)
+  return "mesh-$(stats.num_solid_vertices)-$(stats.num_solid_triangles)"
 end
 
 function get_meshes()
@@ -230,6 +111,13 @@ function get_meshes()
   
   return (Δ₀, Δ₁, Δ₂)
 end
+#
+# PLOTS
+#
+function get_tri_title(Δ)
+  stats = statistics(Δ)
+  return "$(stats.num_solid_triangles) triangles, $(stats.num_solid_vertices) vertices"
+end
 
 function plot_meshes()
   Δs = get_meshes()
@@ -242,77 +130,261 @@ function plot_meshes()
   return nothing
 end
 
-function run_balanced()
-  # LOAD MESHES
-  Δs = get_meshes()
+function plot_fitted(datasets; markersize = 4.0, kwargs...)
+  global MODEL_DIR
+  sort!(datasets, by=extract_mesh_triangles)
+  model_basenames = @. basename(datasets) |> splitext |> first
+  model_filenames = mapreduce(fn -> filter(contains(fn), readdir(MODEL_DIR)), union, model_basenames)
 
-  # RUN BENCHMARKS
-  n, p = 10^4, 10
-  RHO = 5e-2
-  seed = 1903
-  penalties = (
-    ("Ridge", L2Squared()),
-    ("L1Smooth", L1Approx(sqrt(1e-10))),
+  local W = 400
+  local H = 400
+  local NCOL = length(model_basenames)
+  local NROW = div(length(model_filenames), NCOL)
+
+  # Initialize figure with column labels
+  fig = Figure(size = (W * NCOL, H * NROW))
+  Label(fig[2,1], "Observed", font = :bold, rotation = pi/2, tellheight = false)
+
+  cmap = :berlin
+  cr = Observable((0.0, 1.0))
+  for (j, dataset_name) in enumerate(model_basenames)
+    # Retrieve data
+    y, X, S, mesh = load_data(dataset_name*".jld2", "y", "X", "S", "mesh")
+
+    # Update minimum and maximum values for color scale
+    cr[] = (minimum(y), maximum(y))
+
+    # Add a row label with triangulation characteristics
+    Label(fig[1,1+j], get_tri_title(mesh), font = :bold, tellwidth = false)
+
+    # Add a panel for observed data
+    ax = Axis(fig[2,1+j])
+    scatter!(ax, S[1,:], S[2,:]; color = y, colormap = cmap, colorrange = cr, markersize, kwargs...)
+
+    # Predictions
+    matching_models = filter(contains(dataset_name), model_filenames)
+    sort!(matching_models, by=extract_penalty)
+    for (k, model_name) in enumerate(matching_models)
+      model, metadata = load_model(model_name, "model", "metadata")
+      if j == 1
+        Label(fig[2+k,1], metadata.penalty_name, font = :bold, rotation = pi/2, tellheight = false)
+      end
+      yhat = SpatialRegression.predict(X, S, model, mesh; kind = :mean)
+      cr[] = (minimum(yhat), maximum(yhat))
+      ax = Axis(fig[2+k,1+j])
+      scatter!(ax, S[1,:], S[2,:]; color = yhat, colormap = cmap, colorrange = cr, markersize, kwargs...)
+    end
+  end
+  Colorbar(fig[2:2+NROW, 2+NCOL], colormap = cmap, colorrange = cr, vertical = true)
+  return fig
+end
+#
+# MISC
+#
+get_penalty_name(::L2Squared) = "Ridge"
+get_penalty_name(::L1Approx) = "L1Smooth"
+
+function run_benchmark(scenario_name, Δ, y, X, S, family, link, penalty, opts)
+  # Precompile
+  @timed SpatialRegression.fitmodel(VertexGLM, y, X, S, Δ;
+    family    = family,
+    link      = link,
+    penalty   = penalty,
+    nu        = opts.nu,
+    rho       = opts.rho,
+    tol       = opts.tol,
+    backtrack = opts.backtrack,
+    maxiter   = 10,
+    nchunks   = opts.nthreads,
   )
 
-  for (penalty_name, penalty) in penalties
-    scenarios = [
-      #
-      # SCENARIO 1: Uniform over domain, Normal response
-      #
-      (;
-        name    = "Balanced-Normal",
-        data    = Δ -> simulate_data(n, p, Δ, Normal(0.0, 0.1), IdentityLink()),
-        family  = Normal(),
-        link    = IdentityLink(),
-        rho     = RHO,
-        triangulations = Δs,
-        penalty = penalty,
-      ),
-      #
-      # SCENARIO 2: Uniform over domain, Binomial response
-      #
-      (;
-        name    = "Balanced-Binomial",
-        data    = Δ -> simulate_data(n, p, Δ, Binomial(), LogitLink()),
-        family  = Binomial(),
-        link    = LogitLink(),
-        rho     = RHO,
-        triangulations = Δs,
-        penalty = penalty,
-      ),
-      #
-      # SCENARIO 3: Uniform over domain, Poisson response
-      #
-      (;
-        name    = "Balanced-Poisson",
-        data    = Δ -> simulate_data(n, p, Δ, Poisson(), LogLink()),
-        family  = Poisson(),
-        link    = LogLink(),
-        rho     = RHO,
-        triangulations = Δs,
-        penalty = penalty,
-      ),
-    ];
+  # Fit a model with our MM algorithm
+  timed_result = @timed SpatialRegression.fitmodel(VertexGLM, y, X, S, Δ;
+    family    = family,
+    link      = link,
+    penalty   = penalty,
+    nu        = opts.nu,
+    rho       = opts.rho,
+    tol       = opts.tol,
+    backtrack = opts.backtrack,
+    maxiter   = opts.maxiter,
+    nchunks   = opts.nthreads,
+  )
 
-    fig = Figure[]
-    tbl = DataFrame[]
-    ins = []
-    for scenario in scenarios
-      results, instances = run_benchmarks(scenario, seed)
-      figure = plot_fitted(instances)
-      save(joinpath("figures", "Equilateral-$(scenario.name)-$(penalty_name).pdf"), figure)
-      push!(tbl, results)
-      push!(fig, figure)
-      push!(ins, instances)
+  # Collect results and save
+  stats  = statistics(Δ)
+  niter, model, loss = timed_result.value
+  timing = timed_result.time
+  metadata = (;
+    scenario  = scenario_name,
+    dims      = size(X),
+    vertices  = stats.num_solid_vertices,
+    triangles = stats.num_solid_triangles,
+    mesh_id   = mesh_identifier(Δ),
+    family, link, penalty,
+    penalty_name = get_penalty_name(penalty),
+    opts...,
+    niter, loss, timing,
+  )
+
+  return model, metadata
+end
+#
+# DATA GENERATION & PERSISTENCE
+#
+const DATA_DIR  = joinpath("data")
+const MODEL_DIR = joinpath("models")
+const FIG_DIR   = joinpath("figures")
+
+function instantiate_directories()
+  global DATA_DIR
+  global MODEL_DIR
+  global FIG_DIR
+  for relative_dir in (DATA_DIR, MODEL_DIR, FIG_DIR)
+    !isdir(relative_dir) && mkdir(relative_dir)
+  end
+end
+
+function save_data(filename, args...)
+  global DATA_DIR
+  JLD2.save(joinpath(DATA_DIR, filename), args...)
+end
+
+function load_data(filename, args...)
+  global DATA_DIR
+  JLD2.load(joinpath(DATA_DIR, filename), args...)
+end
+
+function filename_data(name, (n, p), mesh_id, seed)
+  "$(name)_dims-$(n)-$(p)_$(mesh_id)_seed-$(seed).jld2"
+end
+
+function retrieve_data(scenario, Δ, seed)
+  filename = filename_data(
+    scenario.name, scenario.dims, mesh_identifier(Δ), seed
+  )
+  if !isfile(joinpath(DATA_DIR, filename))
+    let
+      Random.seed!(seed)
+      y, X, S, B, Φ, _ = scenario.data(Δ)
+      save_data(
+        filename,
+        "y",  y,
+        "X",  X,
+        "S",  S,
+        "B",  B,
+        "Φ",  Φ,
+        "mesh", Δ,
+      )
     end
+  end
+  return load_data(filename, "y", "X", "S")
+end
 
-    foreach(display, fig)
-    foreach(display, tbl)
+function save_model(model, metadata)
+  global MODEL_DIR
+  filename = filename_model(
+    metadata.scenario, metadata.dims, metadata.mesh_id, metadata.seed, metadata.penalty_name
+  )
+  JLD2.save(joinpath(MODEL_DIR, filename),
+    "model",    model,
+    "metadata", metadata,
+  )
+end
 
-    open(joinpath("tables", "Equilateral-Balanced-$(penalty_name).txt"), "w") do io
-      pretty_table(io, vcat(tbl...); backend = :latex)
+function load_model(filename, args...)
+  global MODEL_DIR
+  JLD2.load(joinpath(MODEL_DIR, filename), args...)
+end
+
+function filename_model(name, (n, p), mesh_id, seed, penalty)
+  "$(name)_dims-$(n)-$(p)_$(mesh_id)_seed-$(seed)_$(penalty).jld2"
+end
+
+function extract_mesh_triangles(filename)
+  bn = basename(filename) |> splitext |> first
+  parts = split(bn, '_')
+  mesh_id = parts[findfirst(contains("mesh"), parts)]
+  return parse(Int, split(mesh_id, '-')[3])
+end
+
+function extract_penalty(filename)
+  bn = basename(filename) |> splitext |> first
+  penalty_name = split(bn, '_') |> last
+  return penalty_name == "Ridge" ? 1 : 2
+end
+#
+# MAIN FUNCTIONS
+#
+function run_balanced(; bench=true, plot=true)
+  instantiate_directories()
+
+  n, p  = 4*10^4, 1
+  rho   = 1.0
+  nu    = 1.0
+  tol   = 1e-6
+  seed  = 1903
+  maxiter   = 2*10^3
+  nthreads  = 4
+  backtrack = 100
+  penalties = (L2Squared(), L1Approx(sqrt(1e-16)))
+
+  scenarios = [
+    #
+    # SCENARIO 1: Uniform over domain, Normal response
+    #
+    (;
+      name    = "Equilateral-Uniform-Normal",
+      dims    = (n, p),
+      data    = Δ -> simulate_data(n, p, Δ, Normal(), IdentityLink()),
+      family  = Normal(),
+      link    = IdentityLink(),
+    ),
+    #
+    # SCENARIO 2: Uniform over domain, Binomial response
+    #
+    (;
+      name    = "Equilateral-Uniform-Binomial",
+      dims    = (n, p),
+      data    = Δ -> simulate_data(n, p, Δ, Binomial(), LogitLink()),
+      family  = Binomial(),
+      link    = LogitLink(),
+    ),
+    #
+    # SCENARIO 3: Uniform over domain, Poisson response
+    #
+    (;
+      name    = "Equilateral-Uniform-Poisson",
+      dims    = (n, p),
+      data    = Δ -> simulate_data(n, p, Δ, Poisson(), LogLink()),
+      family  = Poisson(),
+      link    = LogLink(),
+    ),
+  ];
+
+  meshes = get_meshes()
+  opts = (; rho, nu, tol, maxiter, nthreads, backtrack)
+
+  bench && for scenario in scenarios, Δ in meshes
+    stats = statistics(Δ)
+    vertices = stats.num_solid_vertices
+    triangles = stats.num_solid_triangles
+    y, X, S = retrieve_data(scenario, Δ, seed)
+    for penalty in penalties
+      @info "Running $(scenario.name)..." penalty = get_penalty_name(penalty) vertices triangles
+      model, _metadata = run_benchmark(scenario.name, Δ, y, X, S, scenario.family, scenario.link, penalty, opts)
+      metadata = (; _metadata..., seed)
+      @info "Saving model..."
+      save_model(model, metadata)
     end
+  end
+
+  plot && for scenario in scenarios
+    global DATA_DIR
+    global FIG_DIR
+    datasets = filter(contains(scenario.name), readdir(DATA_DIR))
+    fig = plot_fitted(datasets)
+    save(joinpath(FIG_DIR, scenario.name*".pdf"), fig)
   end
 end
 end # module
@@ -324,4 +396,3 @@ if !isinteractive()
   Equilateral.plot_meshes()
   Equilateral.run_balanced()
 end
-
