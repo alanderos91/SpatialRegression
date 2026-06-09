@@ -17,9 +17,12 @@ using LinearAlgebra, Random, Statistics, Distributions, GLM
 using DelaunayTriangulation
 using SpatialRegression
 using CairoMakie
-using DataFrames, PrettyTables
+using DataFrames, PrettyTables, CategoricalArrays
 using JLD2
 using SpatialRegression: L2Squared, L1Approx, AsymmetricLaplace, ALD
+
+LABEL_FONTSIZE = 24
+SCALE_FACTOR = 4
 
 function equilateral_refinement(Δ, max_area)
   Δnew = refine!(deepcopy(Δ),
@@ -120,18 +123,20 @@ function get_tri_title(Δ)
 end
 
 function plot_meshes()
+  global LABEL_FONTSIZE, SCALE_FACTOR
   Δs = get_meshes()
   figtri = Figure(size = (400*length(Δs), 400));
   for (j, Δ) in enumerate(Δs)
-    ax = Axis(figtri[1,j], title = get_tri_title(Δ))
-    triplot!(ax, Δ)
+    ax = Axis(figtri[1,j], title = get_tri_title(Δ), titlesize = LABEL_FONTSIZE)
+    plt = triplot!(ax, Δ)
+    plt.rasterize = SCALE_FACTOR
   end
-  save(joinpath("figures", "Equilateral-Meshes.pdf"), figtri)
+  save(joinpath("figures", "Equilateral-Meshes.pdf"), figtri,)
   return nothing
 end
 
 function plot_fitted(datasets; markersize = 4.0, kwargs...)
-  global MODEL_DIR
+  global MODEL_DIR, LABEL_FONTSIZE, SCALE_FACTOR
   sort!(datasets, by=extract_mesh_triangles)
   model_basenames = @. basename(datasets) |> splitext |> first
   model_filenames = mapreduce(fn -> filter(contains(fn), readdir(MODEL_DIR)), union, model_basenames)
@@ -143,7 +148,7 @@ function plot_fitted(datasets; markersize = 4.0, kwargs...)
 
   # Initialize figure with column labels
   fig = Figure(size = (W * NCOL, H * NROW))
-  Label(fig[2,1], "Observed", font = :bold, rotation = pi/2, tellheight = false)
+  Label(fig[2,1], "Observed", font = :bold, fontsize = LABEL_FONTSIZE, rotation = pi/2, tellheight = false)
 
   cmap = :berlin
   cr = Observable((0.0, 1.0))
@@ -155,11 +160,11 @@ function plot_fitted(datasets; markersize = 4.0, kwargs...)
     cr[] = (minimum(y), maximum(y))
 
     # Add a row label with triangulation characteristics
-    Label(fig[1,1+j], get_tri_title(mesh), font = :bold, tellwidth = false)
+    Label(fig[1,1+j], get_tri_title(mesh), font = :bold, fontsize = LABEL_FONTSIZE, tellwidth = false)
 
     # Add a panel for observed data
     ax = Axis(fig[2,1+j])
-    scatter!(ax, S[1,:], S[2,:]; color = y, colormap = cmap, colorrange = cr, markersize, kwargs...)
+    scatter!(ax, S[1,:], S[2,:]; color = y, colormap = cmap, colorrange = cr, markersize, rasterize = SCALE_FACTOR, kwargs...)
 
     # Predictions
     matching_models = filter(contains(dataset_name), model_filenames)
@@ -167,12 +172,12 @@ function plot_fitted(datasets; markersize = 4.0, kwargs...)
     for (k, model_name) in enumerate(matching_models)
       model, metadata = load_model(model_name, "model", "metadata")
       if j == 1
-        Label(fig[2+k,1], metadata.penalty_name, font = :bold, rotation = pi/2, tellheight = false)
+        Label(fig[2+k,1], metadata.penalty_name, font = :bold, fontsize = LABEL_FONTSIZE, rotation = pi/2, tellheight = false)
       end
       yhat = SpatialRegression.predict(X, S, model, mesh; kind = :mean)
       cr[] = (minimum(yhat), maximum(yhat))
       ax = Axis(fig[2+k,1+j])
-      scatter!(ax, S[1,:], S[2,:]; color = yhat, colormap = cmap, colorrange = cr, markersize, kwargs...)
+      scatter!(ax, S[1,:], S[2,:]; color = yhat, colormap = cmap, colorrange = cr, markersize, rasterize = SCALE_FACTOR, kwargs...)
     end
   end
   Colorbar(fig[2:2+NROW, 2+NCOL], colormap = cmap, colorrange = cr, vertical = true)
@@ -301,17 +306,121 @@ function filename_model(name, (n, p), mesh_id, seed, penalty)
   "$(name)_dims-$(n)-$(p)_$(mesh_id)_seed-$(seed)_$(penalty).jld2"
 end
 
-function extract_mesh_triangles(filename)
+function extract_parts(filename)
   bn = basename(filename) |> splitext |> first
-  parts = split(bn, '_')
+  return split(bn, '_')
+end
+
+function extract_family(filename)
+  parts = extract_parts(filename)
+  return split(parts[1], '-')[3]
+end
+
+function extract_mesh_triangles(filename)
+  parts = extract_parts(filename)
   mesh_id = parts[findfirst(contains("mesh"), parts)]
   return parse(Int, split(mesh_id, '-')[3])
 end
 
 function extract_penalty(filename)
-  bn = basename(filename) |> splitext |> first
-  penalty_name = split(bn, '_') |> last
+  parts = extract_parts(filename)
+  penalty_name = last(parts)
   return penalty_name == "Ridge" ? 1 : 2
+end
+#
+# TABLES
+#
+function table_summary()
+  tbl = DataFrame(
+    family    = String[],
+    vertices  = Int[],
+    triangles = Int[],
+    penalty   = String[],
+    itr       = Int[],
+    sec       = Float64[],
+    rmse1     = Float64[],
+    rmse2     = Float64[],
+    rmse3     = Float64[],
+  )
+  data_filenames = filter(contains("Equilateral-Uniform"), readdir(DATA_DIR))
+  map(data_filenames) do fn
+    file_basename = basename(fn) |> splitext |> first
+    family = extract_family(fn)
+    (y, X, S, B, Φ, mesh) = load_data(fn, "y", "X", "S", "B", "Φ", "mesh")
+    stats = statistics(mesh)
+    matching_models = filter(contains(file_basename), readdir(MODEL_DIR))
+    map(matching_models) do modelfile
+      model, metadata = load_model(modelfile, "model", "metadata")
+      
+      yhat = SpatialRegression.predict(X, S, model, mesh; kind = :mean)
+      Bhat = hcat([v.beta for v in model.vertex]...)
+      Φhat = [v.extra_params[:dispersion] for v in model.vertex]
+      
+      rmse1 = mean(abs2, y - yhat) |> sqrt
+      rmse2 = mean(abs2, B - Bhat) |> sqrt
+      rmse3 = mean(abs2, Φ - Φhat) |> sqrt
+      
+      push!(tbl, (
+        family, stats.num_solid_vertices, stats.num_solid_triangles,
+        metadata.penalty_name, metadata.niter, metadata.timing,
+        rmse1, rmse2, rmse3,
+      ))
+    end
+  end
+  return tbl
+end
+
+function fancy_table(df)
+  # Sort for cleaner grouping
+  df.family = categorical(df.family, ordered = true, levels = ["Normal", "Binomial", "Poisson"])
+  df.penalty = categorical(df.penalty, ordered = true, levels = ["Ridge", "L1Smooth"])
+  sort!(df, [:family, :penalty, :vertices])
+
+row_groups = [
+    10  => "Binomial — L1Smooth",
+    7   => "Binomial — Ridge",
+    4   => "Normal — L1Smooth",
+    1   => "Normal — Ridge",
+    16  => "Poisson — L1Smooth",
+    13  => "Poisson — Ridge",
+]
+
+# Booktabs-style format
+table_format = LatexTableFormat(
+    horizontal_line_at_beginning = true,
+    horizontal_line_after_column_labels = true,
+    horizontal_lines_at_data_rows = :none,
+    vertical_lines_at_data_columns = :none,
+)
+
+pretty_table(
+    select(df, Not([:family, :penalty]));   # remove redundant columns
+    backend = :latex,
+
+    table_format = table_format,
+
+    column_labels = [
+        "Vertices",
+        "Triangles",
+        "Itrations",
+        "Time (s)",
+        "RMSE1",
+        "RMSE2",
+        "RMSE3",
+    ],
+
+    formatters = [
+        fmt__printf("%.2f", [4]),
+        fmt__printf("%.3f", [5]),
+        fmt__latex_sn(2, [6, 7]),
+    ],
+
+    alignment = [
+        :r, :r, :r, :r, :r, :r, :r
+    ],
+
+    row_group_labels = row_groups,
+)
 end
 #
 # MAIN FUNCTIONS
