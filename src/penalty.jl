@@ -139,7 +139,7 @@ function update_empty_case!(::L2Squared, v, weights, caches)
   mul!(v.beta_new, gamma, weights)
   sumw = sum(weights)
   @. v.beta_new = v.beta_new / sumw
-  return nothing
+  return v
 end
 
 function update_empty_case!(p::L1Approx, v, weights, caches)
@@ -156,5 +156,5 @@ function update_empty_case!(p::L1Approx, v, weights, caches)
     end
     v.beta_new[k] = num / den
   end
-  return nothing
+  return v
 end

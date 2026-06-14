@@ -10,6 +10,7 @@ using ChunkSplitters
 using GLM: glm, coef, dispersion
 
 import Distributions
+import Accessors
 
 # Imports for writing custom chunkable iterators
 import Base:
@@ -38,13 +39,5 @@ export TriangleObs,
 
 include("penalty.jl")
 export L2Squared, L1Approx
-
-function initialize_coefficients!(tobs, vmod)
-  for v in vmod
-    if !isempty(v.triangles)
-      initialize_coefficients!(v, tobs, vmod)
-    end
-  end
-end
 
 end

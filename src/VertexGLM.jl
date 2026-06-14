@@ -15,7 +15,7 @@ struct VertexGLM{D <: UnivariateDistribution, L <: Link} <: AbstractVertexModel
   eta::Vector{Float64}        # linear predictor, η = xᵀβ
   mu::Vector{Float64}         # mean parameter vector, μ = g⁻¹(η)
   workres::Vector{Float64}    # working residuals, (y - μ) g'(μ)
-  extra_params::Dict{Symbol,Float64}
+  dispersion::Float64         # may be transformed while fitting
 end
 
 infer_vertex_type(::Type{VertexGLM}, ::D, ::L; kwargs...) where {D <: UnivariateDistribution, L <: Link} = VertexGLM{D,L}
@@ -23,7 +23,6 @@ infer_vertex_type(::Type{VertexGLM}, ::D, ::L; kwargs...) where {D <: Univariate
 function create_vertex(::Type{VertexGLM{D,L}}, index, part, triangles, neighbors, weights, nobs, nvar;
   family::D = Normal(),
   link::L   = IdentityLink(),
-  nu::Real  = 2, 
   kwargs...) where {D <: UnivariateDistribution, L <: Link}
   d = zeros(nobs)
   beta = zeros(nvar)
@@ -31,15 +30,11 @@ function create_vertex(::Type{VertexGLM{D,L}}, index, part, triangles, neighbors
   eta = zeros(nobs)
   mu = zeros(nobs)
   workres = zeros(nobs)
-  extra_params = Dict(
-    :dispersion => 1.0,
-    :global_dispersion => 1.0,
-    :nu => float(nu),
-  )
+  dispersion = 1.0
   return VertexGLM(
     index, part, triangles, neighbors, weights,
     nobs, nvar, family, link, d, beta, beta_new,
-    eta, mu, workres, extra_params
+    eta, mu, workres, dispersion
   )
 end
 #
@@ -51,6 +46,8 @@ function build_caches(triobs::Vector{TriangleObs}, vertex::Vector{V}, ::Abstract
     logf = init_cache_logf(triobs),
     # matrix of local average coefficients in MM algorithm, Γ
     gamma = init_cache_gamma(vertex, nvar),
+    # local average dispersion parameters in MM algorithm, avgϕ
+    avgphi = init_cache_avgphi(vertex),
     # ∇L, ∇²L, Δ
     workspace = [(zeros(nvar), zeros(nvar, nvar), zeros(nvar)) for _ in 1:nchunks]
   )
@@ -63,6 +60,7 @@ function update_caches!(model::SpatialVertexModel{<:VertexGLM}; nchunks::Int = T
       for v in workitr
         update_cache_logf!(model.caches.logf, v, model.triobs)
         update_cache_gamma!(model.caches.gamma, v, model.vertex)
+        needs_dispersion(v.family) && update_cache_avgphi!(model.caches.avgphi, v, model.vertex)
       end
     end
   end nchunks=nchunks
@@ -72,44 +70,26 @@ function update_caches_serial!(model::SpatialVertexModel{<:VertexGLM})
   for v in eachvertex(model)
     update_cache_logf!(model.caches.logf, v, model.triobs)
     update_cache_gamma!(model.caches.gamma, v, model.vertex)
+    needs_dispersion(v.family) && update_cache_avgphi!(model.caches.avgphi, v, model.vertex)
   end
 end
+#
+# FAMILY-SPECIFIC PARAMETER PENALTIES
+#
+eval_dispersion_penalty(::UnivariateDistribution, vertex) = zero(Float64)
 
-eval_log_prior_vertex(::Vector, v::VertexGLM; kwargs...) = eval_log_prior_vertex(v.extra_params[:dispersion], v; kwargs...)
-
-function eval_log_prior_vertex(phi::Real, v::VertexGLM; use_prior::Bool = false)
-  if needs_dispersion(v.family)
-    if use_prior
-      # assumes conjugancy with Gaussian-like distribution
-      nu = v.extra_params[:nu]
-      phi0 = v.extra_params[:global_dispersion]
-      Distributions.logpdf(Distributions.Gamma(nu/2+1, 2*phi0/nu), phi)
-    else
-      # convex log penalty on ratios; flipped signed!
-      nu = v.extra_params[:nu]
-      A = v.extra_params[:local_dispersion]
-      nu * 1//2 * log(phi / A)
+function eval_dispersion_penalty(::Normal, vertex)
+  penalty = zero(Float64)
+  for v in vertex
+    phi_j = v.dispersion
+    penalty += -log(phi_j) + 1//2*abs2(phi_j)
+    for (i, k) in enumerate(v.neighbors)
+      u = vertex[k]
+      phi_k = u.dispersion
+      penalty += 1//4 * v.weights[i] * abs2(phi_j - phi_k)
     end
-  else
-    zero(phi)
   end
-end
-
-function eval_prior_loss(vertex::Vector{V}; nchunks::Int = Threads.nthreads(), kwargs...) where V <: VertexGLM
-  if needs_dispersion(first(vertex).family)
-    logl = @tasks for v in vertex
-      @set begin
-        ntasks = nchunks
-        reducer = +
-        outputtype = Float64
-      end
-      local phi = v.extra_params[:dispersion]
-      eval_log_prior_vertex(phi, v; kwargs...)
-    end
-  else
-    logl = 0.0
-  end
-  return -logl
+  return 1//2*penalty
 end
 #
 # SURROGATE
@@ -117,7 +97,7 @@ end
 function eval_loss_surrogate(beta::Vector, v::VertexGLM, triobs::Vector{TriangleObs}, caches)
   cache = caches.logf
   logl = zero(Float64)
-  phi = v.extra_params[:dispersion]
+  phi = v.dispersion
   j, family, link = v.index, v.family, v.link
   for (triidx, T) in eachtriobs(triobs, v)
     t = get_triangle_vertices(T, j)
@@ -135,7 +115,6 @@ function eval_loss_surrogate(beta::Vector, v::VertexGLM, triobs::Vector{Triangle
       # Evaluate terms dependent on the anchor point βₙ
       zweight = stable_convex_weight(t, alpha, logf)
       tmp = zweight < eps() ? zero(zweight) : zweight * logfⱼ + zweight * (log(alpha[t]) + log(inv(zweight)))
-      # @assert !isnan(tmp) && !isinf(tmp) "bad weighted log-likelihood @ vertex $(v.index)\n\tη: $(eta)\n\tμ: $(mu)\n\tφ: $(phi)\n\tlogf: $(logfⱼ)\n\tz: $(zweight)"
       logl += tmp
     end
   end
@@ -162,39 +141,23 @@ function eval_loss_surrogate(phi::Real, v::VertexGLM, triobs::Vector{TriangleObs
       # Evaluate terms dependent on the anchor point φₙ
       zweight = stable_convex_weight(t, alpha, logf)
       tmp = zweight < eps() ? zero(zweight) : zweight * logfⱼ + zweight * (log(alpha[t]) + log(inv(zweight)))
-      # @assert !isnan(tmp) && !isinf(tmp) "bad weighted log-likelihood @ vertex $(v.index)\n\tNobs: $(v.nobs)\n\tη: $(eta)\n\tμ: $(mu)\n\tφ: $(phi)\n\tlogf: $(logfⱼ)\n\tz: $(zweight)"
       logl += tmp
     end
   end
   return -logl
 end
 
-function eval_prior_surrogate(phi::Real, v::VertexGLM, vertex, use_prior)
-  if needs_dispersion(v.family)
-    if use_prior
-      # assumes conjugancy with Gaussian-like distribution
-      nu = v.extra_params[:nu]
-      phi0 = v.extra_params[:global_dispersion]
-      Distributions.logpdf(Distributions.Gamma(nu/2+1, 2*phi0/nu), phi)
-    else
-      # convex log penalty on ratios; flipped signed!
-      nu = v.extra_params[:nu]
-      A_j = v.extra_params[:local_dispersion]
-      B_j = 0.0
-      for (idx, k) in enumerate(v.neighbors)
-        u = vertex[k]
-        B_j += v.weights[idx] / u.extra_params[:local_dispersion]
-      end
-      return nu * 1//2 * (-log(phi / A_j) + phi * B_j - 1)
-    end
-  else
-    zero(phi)
+function eval_dispersion_surrogate(::Normal, phi_j, weights, avgphi)
+  penalty = -log(phi_j) + 1//2*abs2(phi_j)
+  @inbounds for (w_jk, avgphi_jk) in zip(weights, avgphi)
+    penalty += w_jk * abs2(phi_j - avgphi_jk)
   end
+  return 1//2*penalty
 end
 #
 # UPDATES
 #
-function initialize_coefficients!(v::VertexGLM, triobs, vertex)
+function initialize_coefficients!(v::VertexGLM, triobs)
   X = similar(v.beta, length(v.d), length(v.beta))
   y = similar(v.beta, length(v.d))
   for (k, idxrange) in zip(v.triangles, v.part)
@@ -204,10 +167,7 @@ function initialize_coefficients!(v::VertexGLM, triobs, vertex)
   end
   fitted = glm(X, y, v.family, v.link)
   v.beta .= coef(fitted)
-  if needs_dispersion(v.family)
-    v.extra_params[:dispersion] = 1
-  end
-  return nothing
+  return v
 end
 
 function mm_update_coef!(penalty::AbstractPenalty, g::CoefficientSurrogate, v::VertexGLM, triobs::Vector{TriangleObs}, workspace, caches, opt)
@@ -225,7 +185,7 @@ function mm_update_coef!(penalty::AbstractPenalty, g::CoefficientSurrogate, v::V
 
   fill!(∇L, 0); fill!(∇²L, 0)
   itr = zip(eachtriobs(triobs, v), v.part)
-  phi = v.extra_params[:dispersion]
+  phi = v.dispersion
 
   # Update the coefficients using IRWLS
   for ((triidx, T), idxrange) in itr
@@ -243,14 +203,13 @@ function mm_update_coef!(penalty::AbstractPenalty, g::CoefficientSurrogate, v::V
           d[idx] = one(zweight)
           r[idx] = zero(zweight)
       end
-      # @assert zweight > 0 "MM Update w/ Zero Weight @ Vertex $(v.index)\n\tObs. Index: $(idx)\n\talpha = $(alpha)\n\tlogf = $(logf)\n\tResidual: $(r[idx])\n\tIRLS Weight: $(stable_irls_weight(family, link, η[idx], μ[idx], dμdη))"
 
       # Evaluate gradient + Hessian
       if v.nvar > 1
         BLAS.axpy!(-d[idx]*r[idx] * dispfun(family, phi), x, ∇L)
         BLAS.syr!('U', d[idx] * dispfun(family, phi), x, ∇²L)
       else
-        ∇L[1] = ∇L[1] - d[idx]*r[idx]*x[1]
+        ∇L[1] = ∇L[1] - d[idx]*r[idx] * dispfun(family, phi) * x[1]
         ∇²L[1] = ∇²L[1] + d[idx] * dispfun(family, phi) * x[1]*x[1]
       end
     end
@@ -263,6 +222,7 @@ function mm_update_coef!(penalty::AbstractPenalty, g::CoefficientSurrogate, v::V
     Δ[1] = ∇L[1] / ∇²L[1]
   end
   linesearch!(g, v.beta_new, v.beta, Δ, backtrack)
+  return v
 end
 
 function mm_update_disp!(::UnivariateDistribution, g::DispersionSurrogate, v::VertexGLM, triobs::Vector{TriangleObs}, workspace, caches)
@@ -272,11 +232,13 @@ end
 function mm_update_disp!(::Normal, g::DispersionSurrogate, v::VertexGLM, triobs::Vector{TriangleObs}, workspace, caches)
   # Setup local variables to match notation
   μ = v.mu
+  nu = g.nu
+  avgphi = caches.avgphi[v.index]
 
   itr = zip(eachtriobs(triobs, v), v.part)
 
   # Fix β, update φ
-  num = den = zero(eltype(v.beta))
+  rss = n_j = zero(eltype(v.beta))
   for ((triidx, T), idxrange) in itr
     y, A, t = T.y, T.A, get_triangle_vertices(T, v.index)
     F = caches.logf[triidx]
@@ -284,60 +246,23 @@ function mm_update_disp!(::Normal, g::DispersionSurrogate, v::VertexGLM, triobs:
       alpha = @get_triple A i
       logf = @get_triple F i
       zweight = stable_convex_weight(t, alpha, logf)
-      num += zweight * deviance(v.family, y[i], μ[idx])
-      den += zweight
-      # v.index == 1 && @show zweight, deviance(v.family, y[i], μ[idx])
+      rss += zweight * deviance(v.family, y[i], μ[idx])
+      n_j += zweight
     end
   end
 
-  if g.use_prior
-    phi0 = v.extra_params[:global_dispersion]
-    nu = v.extra_params[:nu]
-    if !isempty(v.triangles)
-      phi = (den + nu) / (num + nu / phi0)
-    else
-      phi = phi0
-    end
+  a = 1//2*nu * (1 + 2*sum(v.weights))
+  b = nu * dot(avgphi, v.weights) - 1//2*rss
+  c = 1//2 * (n_j + nu)
+  phi1 = (b + sqrt(b*b + 4*a*c)) / (2*a)
+  phi2 = (b - sqrt(b*b + 4*a*c)) / (2*a)
+  if phi2 > 0
+    phi = g(phi1) < g(phi2) ? phi1 : phi2
   else
-    nu = v.extra_params[:nu]
-    B = zero(den)
-    for (idx, k) in enumerate(v.neighbors)
-      u = g.model.vertex[k]
-      B_k = u.extra_params[:local_dispersion]
-      B += v.weights[idx] * inv(B_k)
-    end
-    phi = (den + nu) / (num + nu * B)
+    phi = phi1
   end
-
-  # phi_old = v.extra_params[:dispersion]
-  # g_prev = g(phi_old)
-  # g_curr = g(phi)
-  # @assert g_curr < g_prev || abs(g_curr - g_prev) < sqrt(eps()) * (1 + abs(g_prev)) "\n\tVertex: $(v.index)\n\tNobs: $(v.nobs)\n\tPrevious: $(g_prev)\n\t Current: $(g_curr)\n\tDen/Num: $(den) / $(num)\n\tφ₀: $(phi_old)\n\tφ: $(phi)\n\tβ: $(v.beta)"
-
-  v.extra_params[:dispersion] = isinf(phi) ? one(phi) : phi
-end
-
-function update_pooling!(model, use_prior)
-  if use_prior
-    J, phi0 = length(model.vertex), 0.0
-    for v in eachvertex(model)
-      nu = v.extra_params[:nu]
-      phi0 += 1/J * nu/(nu+2) * v.extra_params[:dispersion]
-    end
-    for v in eachvertex(model)
-      v.extra_params[:global_dispersion] = phi0
-    end
-  else
-    for v in eachvertex(model)
-      wphi = zero(Float64)
-      for (idx, k) in enumerate(v.neighbors)
-        u = model.vertex[k]
-        phi_k = u.extra_params[:dispersion]
-        wphi += v.weights[idx] * phi_k
-      end
-      v.extra_params[:local_dispersion] = wphi
-    end
-  end
+  v = Accessors.@set v.dispersion = phi
+  return v
 end
 
 function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
@@ -347,8 +272,8 @@ function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
     backtrack::Int = 5,
     tol::Real = 1e-3,
     rho::Real = 1.0,
+    nu::Real = 1.0,
     nchunks::Int = Threads.nthreads(),
-    use_prior::Bool = false,
     verbose::Bool = false,
     kwargs...
     # intercept = all(isequal(1), view(Xfull, :, 1)),
@@ -357,15 +282,14 @@ function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
   VT = infer_vertex_type(VertexGLM, family, link; kwargs...)
   model = f = create_model(VT, yfull, Xfull, Sfull, tri; nchunks, family, link, kwargs...)
   update_phi = needs_dispersion(family)
-  initialize_coefficients!(model.triobs, model.vertex)
+  initialize!(model)
   update_caches!(model; nchunks)
-  update_phi && update_pooling!(model, use_prior)
 
   # Main loop
-  nlogl = f(rho; nchunks, use_prior)
+  nlogl = f(rho, nu; nchunks)
   nlogl_prev = zero(nlogl)
   iter = 0
-  opt = (; rho = rho, backtrack = backtrack, use_prior = use_prior)
+  opt = (; rho = rho, nu = nu, backtrack = backtrack)
   while iter < maxiter && abs(nlogl - nlogl_prev) > (1 + abs(nlogl_prev)) * tol
     iter += 1
 
@@ -373,15 +297,15 @@ function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
     update_coefficients!(model, opt, nchunks)
 
     # Visit each vertex once to update auxiliary parameters
+    update_phi && update_caches!(model; nchunks)
     update_phi && update_dispersion!(model, opt, nchunks)
 
     # Synchronize algorithm state and evaluate current model
     update_caches!(model; nchunks)
-    update_phi && update_pooling!(model, use_prior)
 
     # Check convergence
     nlogl_prev = nlogl
-    nlogl = f(rho; nchunks, use_prior)
+    nlogl = f(opt.rho, opt.nu; nchunks)
     verbose && @show iter, nlogl, nlogl_prev - nlogl
     @assert is_approx_decrease(nlogl, nlogl_prev, sqrt(eps()))
   end
@@ -389,8 +313,8 @@ function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
   # Apply all updates
   if update_phi
     for v in eachvertex(model)
-      phi = v.extra_params[:dispersion]
-      v.extra_params[:dispersion] = 1 / phi
+      phi = v.dispersion
+      model.vertex[v.index] = Accessors.@set v.dispersion = 1 / phi
     end
   end
 
@@ -404,7 +328,7 @@ function assemble_mixture(x, s, m, tri, id2vertex, points)
     vertex = (m.vertex[j], m.vertex[k], m.vertex[l])
     alpha = barycentric(s, [p[1] q[1] r[1]; p[2] q[2] r[2]])
     return MixtureModel(
-      [create_component(v.family, v.link, dot(x, v.beta), v.extra_params[:dispersion]) for v in vertex],
+      [create_component(v.family, v.link, dot(x, v.beta), v.dispersion) for v in vertex],
       alpha
     )
 end

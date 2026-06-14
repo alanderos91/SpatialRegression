@@ -19,7 +19,7 @@ function create_vertex_set(
   id2vertex = Dict{Int,Int}(id => j for (j, id) in enumerate(indices))
   
   # This assumes triangles in tobs are labeled using OUR scheme, not the one in the triangulation.
-  wmax = 0.0
+  wmin, wmax = Inf, -Inf
   for (j, id) in enumerate(indices)
     # count the total number of samples incident with vertex j
     nobs, part, triangles = 0, UnitRange{Int}[], Int[]
@@ -40,6 +40,7 @@ function create_vertex_set(
     weights = ones(nneighbors)
     for (k, other) in enumerate(DelaunayTriangulation.iterated_neighbourhood(tri, id, 1))
       weights[k] = 1 / DelaunayTriangulation.dist(get_point(tri, id), get_point(tri, other))
+      wmin = min(wmin, weights[k])
       wmax = max(wmax, weights[k])
     end
 
@@ -69,6 +70,17 @@ function create_model(::Type{VT}, y::Vector{T}, X::Matrix{T}, S::Matrix{T}, tri:
   return SpatialVertexModel(triobs, vertex, penalty, caches)
 end
 #
+# INITIALIZATION HEURISTICS
+#
+function initialize!(model::SpatialVertexModel)
+  for v in eachvertex(model)
+    if !isempty(v.triangles)
+      model.vertex[v.index] = initialize_coefficients!(v, model.triobs)
+      model.vertex[v.index] = Accessors.@set v.dispersion = 1.0
+    end
+  end
+end
+#
 # ITERATION
 #
 eachobsindex(triobs::TriangleObs) = eachindex(triobs.y)
@@ -89,7 +101,7 @@ end
 function update_cache_logf!(cache, v::AbstractVertexModel, triobs::Vector{TriangleObs})
   j, β, η, μ = v.index, v.beta, v.eta, v.mu
   family, link = v.family, v.link
-  φ = v.extra_params[:dispersion]
+  φ = v.dispersion
   for (k, idxrange) in zip(v.triangles, v.part)
     T = triobs[k]
     triidx, y, X = T.triangle, T.y, T.X
@@ -118,14 +130,36 @@ function update_cache_gamma!(cache, v::V, vertex::Vector{V}) where V <: Abstract
     end
   end
 end
+
+function init_cache_avgphi(vertex)
+  update_phi = needs_dispersion(first(vertex).family)
+  if update_phi
+    avgphi = Vector{Vector{Float64}}(undef, length(vertex))
+    for (j, v) in zip(eachindex(avgphi), vertex)
+      avgphi[j] = similar(v.weights)
+    end
+  else
+    avgphi = Vector{Vector{Float64}}(undef, 0)
+  end
+  return avgphi
+end
+
+function update_cache_avgphi!(cache, v::V, vertex::Vector{V}) where V <: AbstractVertexModel
+  phi_j = v.dispersion
+  avgphi = cache[v.index]
+  for (i, k) in zip(eachindex(avgphi), v.neighbors)
+    phi_k = vertex[k].dispersion
+    avgphi[i] = 1//2 * (phi_j + phi_k)
+  end
+end
 #
 # LOSS
 #
-function (f::SpatialVertexModel)(rho; kwargs...)
+function (f::SpatialVertexModel)(rho, nu; kwargs...)
   loss = eval_loss(f.triobs, f.vertex, f.caches; kwargs...)
-  penalty = eval_penalty(f.penalty, f.vertex)
-  prior_loss = eval_prior_loss(f.vertex; kwargs...)
-  return loss + rho*penalty + prior_loss
+  penalty1 = eval_penalty(f.penalty, f.vertex)
+  penalty2 = eval_dispersion_penalty(first(f.vertex).family, f.vertex)
+  return loss + rho*penalty1 + nu*penalty2
 end
 
 function eval_loss(triobs::Vector{TriangleObs}, ::Vector{<:AbstractVertexModel}, caches; nchunks::Int = Threads.nthreads(), kwargs...)
@@ -156,32 +190,36 @@ struct CoefficientSurrogate{V <: AbstractVertexModel, P <: AbstractPenalty, C}
   index::Int
   model::SpatialVertexModel{V,P,C}
   rho::Float64
-  use_prior::Bool
+  nu::Float64
 end
 
 function (g::CoefficientSurrogate)(beta)
+  model = g.model
+  caches = model.caches
   j = g.index
-  v = g.model.vertex[j]
-  loss = eval_loss_surrogate(beta, v, g.model.triobs, g.model.caches)
-  penalty = eval_penalty_surrogate(g.model.penalty, beta, v.weights, g.model.caches.gamma[j], v.beta)
-  log_prior = eval_log_prior_vertex(v.extra_params[:dispersion], v, use_prior = g.use_prior)
-  return loss + g.rho*penalty - log_prior
+  v = model.vertex[j]
+  loss = eval_loss_surrogate(beta, v, model.triobs, caches)
+  penalty1 = eval_penalty_surrogate(model.penalty, beta, v.weights, caches.gamma[j], v.beta)
+  penalty2 = eval_dispersion_surrogate(v.family, v.dispersion, v.weights, caches.avgphi[j])
+  return loss + g.rho*penalty1 + g.nu*penalty2
 end
 
 struct DispersionSurrogate{V <: AbstractVertexModel, P <: AbstractPenalty, C}
   index::Int
   model::SpatialVertexModel{V,P,C}
   rho::Float64
-  use_prior::Bool
+  nu::Float64
 end
 
 function (g::DispersionSurrogate)(phi)
+  model = g.model
+  caches = model.caches
   j = g.index
-  v = g.model.vertex[j]
-  loss = eval_loss_surrogate(phi, v, g.model.triobs, g.model.caches)
-  penalty = eval_penalty_surrogate(g.model.penalty, v.beta, v.weights, g.model.caches.gamma[j], v.beta)
-  log_prior = eval_prior_surrogate(phi, v, g.model.vertex, g.use_prior)
-  return loss + g.rho*penalty + log_prior
+  v = model.vertex[j]
+  loss = eval_loss_surrogate(phi, v, model.triobs, caches)
+  penalty1 = eval_penalty_surrogate(model.penalty, v.beta, v.weights, caches.gamma[j], v.beta)
+  penalty2 = eval_dispersion_surrogate(v.family, phi, v.weights, caches.avgphi[j])
+  return loss + g.rho*penalty1 + g.nu*penalty2
 end
 #
 # ESTIMATION
@@ -193,14 +231,14 @@ function update_coefficients!(model, opt, nchunks)
     tforeach(1:nchunks; chunking = false) do _
       map(workspace) do wrk
         for v in workitr
-          local g = CoefficientSurrogate(v.index, model, opt.rho, opt.use_prior)
+          local g = CoefficientSurrogate(v.index, model, opt.rho, opt.nu)
           if isempty(v.triangles)
             # Case: Incident observation sets are empty
             # Update the coefficients using the penalty term
-            update_empty_case!(model.penalty, v, v.weights, model.caches)
+            model.vertex[v.index] = update_empty_case!(model.penalty, v, v.weights, model.caches)
           else
             # Case: There is at least one non-empty observation set
-            mm_update_coef!(model.penalty, g, v, model.triobs, wrk, model.caches, opt)
+            model.vertex[v.index] = mm_update_coef!(model.penalty, g, v, model.triobs, wrk, model.caches, opt)
           end
         end
       end
@@ -222,8 +260,8 @@ function update_dispersion!(model, opt, nchunks)
     tforeach(1:nchunks; chunking = false) do _
       map(workspace) do wrk
         for v in workitr
-          local g = DispersionSurrogate(v.index, model, opt.rho, opt.use_prior)
-          mm_update_disp!(v.family, g, v, model.triobs, wrk, model.caches)
+          local g = DispersionSurrogate(v.index, model, opt.rho, opt.nu)
+          model.vertex[v.index] = mm_update_disp!(v.family, g, v, model.triobs, wrk, model.caches)
         end
       end
     end
