@@ -1,6 +1,8 @@
 Manifest.toml
+LocalPreferences.toml
 .vscode
 examples/data
+examples/models/*.*
 examples/figures/*.*
 examples/tables/*.*
 dev/
