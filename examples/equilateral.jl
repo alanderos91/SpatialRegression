@@ -92,6 +92,12 @@ function default_equilateral_domain()
   return [[0.0, 1.0], [-sqrt(3)/2, -1/2], [sqrt(3)/2, -1/2]]
 end
 
+function boundary()
+  pts = default_equilateral_domain()
+  pts = [pts; [pts[1]]]
+  return (x=[first(xi) for xi in pts], y=[last(yi) for yi in pts])
+end
+
 function init_triangulation(boundary_points = default_equilateral_domain())
   triangulate_convex(boundary_points, [1, 2, 3]; delete_ghosts = false)
 end
@@ -354,7 +360,7 @@ function table_summary()
       
       yhat = SpatialRegression.predict(X, S, model, mesh; kind = :mean)
       Bhat = hcat([v.beta for v in model.vertex]...)
-      Φhat = [v.extra_params[:dispersion] for v in model.vertex]
+      Φhat = [v.dispersion for v in model.vertex]
       
       rmse1 = mean(abs2, y - yhat) |> sqrt
       rmse2 = mean(abs2, B - Bhat) |> sqrt
