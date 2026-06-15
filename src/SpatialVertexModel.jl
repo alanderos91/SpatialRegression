@@ -158,7 +158,7 @@ end
 function (f::SpatialVertexModel)(rho, nu; kwargs...)
   loss = eval_loss(f.triobs, f.vertex, f.caches; kwargs...)
   penalty1 = eval_penalty(f.penalty, f.vertex)
-  penalty2 = eval_dispersion_penalty(first(f.vertex).family, f.vertex)
+  penalty2 = needs_dispersion(first(f.vertex).family) ? eval_dispersion_penalty(first(f.vertex).family, f.vertex) : zero(penalty1)
   return loss + rho*penalty1 + nu*penalty2
 end
 
@@ -200,7 +200,7 @@ function (g::CoefficientSurrogate)(beta)
   v = model.vertex[j]
   loss = eval_loss_surrogate(beta, v, model.triobs, caches)
   penalty1 = eval_penalty_surrogate(model.penalty, beta, v.weights, caches.gamma[j], v.beta)
-  penalty2 = eval_dispersion_surrogate(v.family, v.dispersion, v.weights, caches.avgphi[j])
+  penalty2 = needs_dispersion(v.family) ? eval_dispersion_surrogate(v.family, v.dispersion, v.weights, caches.avgphi[j]) : zero(penalty1)
   return loss + g.rho*penalty1 + g.nu*penalty2
 end
 
@@ -218,7 +218,7 @@ function (g::DispersionSurrogate)(phi)
   v = model.vertex[j]
   loss = eval_loss_surrogate(phi, v, model.triobs, caches)
   penalty1 = eval_penalty_surrogate(model.penalty, v.beta, v.weights, caches.gamma[j], v.beta)
-  penalty2 = eval_dispersion_surrogate(v.family, phi, v.weights, caches.avgphi[j])
+  penalty2 = needs_dispersion(v.family) ? eval_dispersion_surrogate(v.family, phi, v.weights, caches.avgphi[j]) : zero(penalty1)
   return loss + g.rho*penalty1 + g.nu*penalty2
 end
 #
