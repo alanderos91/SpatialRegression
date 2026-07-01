@@ -186,11 +186,10 @@ end
 #
 # SURROGATE
 #
-struct CoefficientSurrogate{V <: AbstractVertexModel, P <: AbstractPenalty, C}
+struct CoefficientSurrogate{V <: AbstractVertexModel, P <: AbstractPenalty, C, NT}
   index::Int
   model::SpatialVertexModel{V,P,C}
-  rho::Float64
-  nu::Float64
+  opt::NT
 end
 
 function (g::CoefficientSurrogate)(beta)
@@ -198,17 +197,16 @@ function (g::CoefficientSurrogate)(beta)
   caches = model.caches
   j = g.index
   v = model.vertex[j]
-  loss = eval_loss_surrogate(beta, v, model.triobs, caches)
+  loss = eval_loss_surrogate(beta, v, model.triobs, caches, g.opt.xi)
   penalty1 = eval_penalty_surrogate(model.penalty, beta, v.weights, caches.gamma[j], v.beta)
   penalty2 = needs_dispersion(v.family) ? eval_dispersion_surrogate(v.family, v.dispersion, v.weights, caches.avgphi[j]) : zero(penalty1)
-  return loss + g.rho*penalty1 + g.nu*penalty2
+  return loss + g.opt.rho*penalty1 + g.opt.nu*penalty2
 end
 
-struct DispersionSurrogate{V <: AbstractVertexModel, P <: AbstractPenalty, C}
+struct DispersionSurrogate{V <: AbstractVertexModel, P <: AbstractPenalty, C, NT}
   index::Int
   model::SpatialVertexModel{V,P,C}
-  rho::Float64
-  nu::Float64
+  opt::NT
 end
 
 function (g::DispersionSurrogate)(phi)
@@ -216,10 +214,10 @@ function (g::DispersionSurrogate)(phi)
   caches = model.caches
   j = g.index
   v = model.vertex[j]
-  loss = eval_loss_surrogate(phi, v, model.triobs, caches)
+  loss = eval_loss_surrogate(phi, v, model.triobs, caches, g.opt.xi)
   penalty1 = eval_penalty_surrogate(model.penalty, v.beta, v.weights, caches.gamma[j], v.beta)
   penalty2 = needs_dispersion(v.family) ? eval_dispersion_surrogate(v.family, phi, v.weights, caches.avgphi[j]) : zero(penalty1)
-  return loss + g.rho*penalty1 + g.nu*penalty2
+  return loss + g.opt.rho*penalty1 + g.opt.nu*penalty2
 end
 #
 # ESTIMATION
@@ -231,14 +229,14 @@ function update_coefficients!(model, opt, nchunks)
     tforeach(1:nchunks; chunking = false) do _
       map(workspace) do wrk
         for v in workitr
-          local g = CoefficientSurrogate(v.index, model, opt.rho, opt.nu)
+          local g = CoefficientSurrogate(v.index, model, opt)
           if isempty(v.triangles)
             # Case: Incident observation sets are empty
             # Update the coefficients using the penalty term
             model.vertex[v.index] = update_empty_case!(model.penalty, v, v.weights, model.caches)
           else
             # Case: There is at least one non-empty observation set
-            model.vertex[v.index] = mm_update_coef!(model.penalty, g, v, model.triobs, wrk, model.caches, opt)
+            model.vertex[v.index] = mm_update_coef!(model.penalty, g, v, model.triobs, wrk, model.caches)
           end
         end
       end
@@ -260,7 +258,7 @@ function update_dispersion!(model, opt, nchunks)
     tforeach(1:nchunks; chunking = false) do _
       map(workspace) do wrk
         for v in workitr
-          local g = DispersionSurrogate(v.index, model, opt.rho, opt.nu)
+          local g = DispersionSurrogate(v.index, model, opt)
           model.vertex[v.index] = mm_update_disp!(v.family, g, v, model.triobs, wrk, model.caches)
         end
       end

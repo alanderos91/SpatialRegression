@@ -94,7 +94,7 @@ end
 #
 # SURROGATE
 #
-function eval_loss_surrogate(beta::Vector, v::VertexGLM, triobs::Vector{TriangleObs}, caches)
+function eval_loss_surrogate(beta::Vector, v::VertexGLM, triobs::Vector{TriangleObs}, caches, xi)
   cache = caches.logf
   logl = zero(Float64)
   phi = v.dispersion
@@ -121,7 +121,7 @@ function eval_loss_surrogate(beta::Vector, v::VertexGLM, triobs::Vector{Triangle
   return -logl
 end
 
-function eval_loss_surrogate(phi::Real, v::VertexGLM, triobs::Vector{TriangleObs}, caches)
+function eval_loss_surrogate(phi::Real, v::VertexGLM, triobs::Vector{TriangleObs}, caches, xi)
   cache = caches.logf
   logl = zero(Float64)
   j, family, link = v.index, v.family, v.link
@@ -170,7 +170,7 @@ function initialize_coefficients!(v::VertexGLM, triobs)
   return v
 end
 
-function mm_update_coef!(penalty::AbstractPenalty, g::CoefficientSurrogate, v::VertexGLM, triobs::Vector{TriangleObs}, workspace, caches, opt)
+function mm_update_coef!(penalty::AbstractPenalty, g::CoefficientSurrogate, v::VertexGLM, triobs::Vector{TriangleObs}, workspace, caches)
   # Setup local variables to match notation
   family = v.family
   link = v.link
@@ -181,7 +181,6 @@ function mm_update_coef!(penalty::AbstractPenalty, g::CoefficientSurrogate, v::V
   μ = v.mu
   w = v.weights
   ∇L, ∇²L, Δ = workspace
-  backtrack = opt.backtrack
 
   fill!(∇L, 0); fill!(∇²L, 0)
   itr = zip(eachtriobs(triobs, v), v.part)
@@ -214,14 +213,14 @@ function mm_update_coef!(penalty::AbstractPenalty, g::CoefficientSurrogate, v::V
       end
     end
   end
-  accumulate_penalty_derivs!(penalty, ∇L, ∇²L, v, Γ, g.rho)
+  accumulate_penalty_derivs!(penalty, ∇L, ∇²L, v, Γ, g.opt.rho)
   if v.nvar > 1
     H = Symmetric(∇²L, :U)
     ldiv!(Δ, cholesky!(H), ∇L)
   else
     Δ[1] = ∇L[1] / ∇²L[1]
   end
-  linesearch!(g, v.beta_new, v.beta, Δ, backtrack)
+  linesearch!(g, v.beta_new, v.beta, Δ, g.opt.backtrack)
   return v
 end
 
@@ -232,7 +231,7 @@ end
 function mm_update_disp!(::Normal, g::DispersionSurrogate, v::VertexGLM, triobs::Vector{TriangleObs}, workspace, caches)
   # Setup local variables to match notation
   μ = v.mu
-  nu = g.nu
+  nu = g.opt.nu
   avgphi = caches.avgphi[v.index]
 
   itr = zip(eachtriobs(triobs, v), v.part)
@@ -289,7 +288,7 @@ function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
   nlogl = f(rho, nu; nchunks)
   nlogl_prev = zero(nlogl)
   iter = 0
-  opt = (; rho = rho, nu = nu, backtrack = backtrack)
+  opt = (; rho = rho, nu = nu, xi = zero(rho), backtrack = backtrack)
   while iter < maxiter && abs(nlogl - nlogl_prev) > (1 + abs(nlogl_prev)) * tol
     iter += 1
 
