@@ -1,5 +1,6 @@
 module AdaptiveRefinement
 using DelaunayTriangulation, Distances, NearestNeighbors
+using StaticArrays
 
 struct SizingField{NNT <: NNTree}
   knn::NNT
@@ -21,7 +22,7 @@ end
 
 function (field::SizingField)(x, y)
   # compute distance to nearest point in the data
-  _, dist = nn(field.knn, [x, y])
+  _, dist = nn(field.knn, SA[x, y])
   return dist*dist
 end
 
