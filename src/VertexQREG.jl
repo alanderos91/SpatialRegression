@@ -11,57 +11,76 @@ prox_pinball(r, tau, mu) = begin
   end
 end
 #
-# CACHES
+# FAMILY-SPECIFIC PARAMETER PENALTIES
 #
-# function build_caches(triobs::Vector{TriangleObs}, vertex::Vector{V}, ::AbstractPenalty, nvars, nchunks) where V <: VertexQREG
-#   return (;
-#     # Store residuals and proximal values for each triangle
-#     residuals = Dict(triidx => zeros(3, length(t.y)) for (triidx, t) in TriangleObsIterator(triobs)),
-#     proximals = Dict(triidx => zeros(3, length(t.y)) for (triidx, t) in TriangleObsIterator(triobs)),
-#     # matrix of local average coefficients in MM algorithm, Γ
-#     gamma = Dict(v.index => zeros(nvars, length(v.neighbors)) for v in vertex),
-#     # LHS and RHS for each worker
-#     workspace = [(zeros(nvars, nvars), zeros(nvars)) for _ in 1:nchunks]
-#   )
-# end
+function eval_dispersion_penalty(::ALD, vertex)
+  penalty = zero(Float64)
+  for v in vertex
+    phi_j = v.dispersion
+    penalty += -log(phi_j) + 1//2*abs2(phi_j)
+    for (i, k) in enumerate(v.neighbors)
+      u = vertex[k]
+      phi_k = u.dispersion
+      penalty += 1//4 * v.weights[i] * abs2(phi_j - phi_k)
+    end
+  end
+  return penalty
+end
 #
 # SURROGATE
 #
-# function eval_loss_surrogate(beta, v::V, triobs::Vector{TriangleObs}, caches, tau, mu) where V <: VertexQREG
-#   zcache = caches.proximals
-#   n = length(v.d)
-#   n = ifelse(iszero(n), one(n), n)
-#   loss = zero(Float64)
-#   for (triidx, T) in eachtriobs(triobs, v)
-#     t = get_triangle_vertices(T, v.index)
-#     for i in eachobsindex(T)
-#       y = T.y[i]
-#       x = view(T.X, :, i)
-#       a = view(T.A, :, i)
-#       z = view(zcache[triidx], :, i)
+function eval_loss_surrogate(beta::Vector, v::VertexGLM{<:ALD}, triobs::Vector{TriangleObs}, caches, xi)
+  cache = caches.logf
+  logl = zero(Float64)
+  phi = v.dispersion
+  j, family, link = v.index, v.family, v.link
+  tau = family.τ
+  for (triidx, T) in eachtriobs(triobs, v)
+    t = get_triangle_vertices(T, j)
+    F = cache[triidx]
+    for i in eachobsindex(T)
+      x = view(T.X, i, :)
+      alpha = @get_triple T.A i
+      logf = @get_triple F i
 
-#       r = y - dot(x, beta)
-#       loss += a[t]/n * (pinball(z[t], tau) + 1//2*inv(mu) * abs2(r - z[t]))
-#     end
-#   end
-#   return loss
-# end
+      # Evaluate log-likelihood term at β
+      mu = v.nvar > 1 ? dot(x, beta) : x[1]*beta[1]
+      r = T.y[i] - mu
+      u = prox_pinball(r, tau, xi)
+      loss = -phi*(pinball(u, tau) + 1//2*inv(xi)*abs2(r - u))
+
+      # Evaluate terms dependent on the anchor point βₙ
+      zweight = stable_convex_weight(t, alpha, logf)
+      tmp = zweight < eps() ? zero(zweight) : zweight * loss + zweight * (log(alpha[t]) + log(inv(zweight)))
+      logl += tmp
+    end
+  end
+  return -logl
+end
+
+function eval_dispersion_surrogate(::ALD, phi_j, weights, avgphi)
+  penalty = -log(phi_j) + 1//2*abs2(phi_j)
+  @inbounds for (w_jk, avgphi_jk) in zip(weights, avgphi)
+    penalty += w_jk * abs2(phi_j - avgphi_jk)
+  end
+  return penalty
+end
 #
 # UPDATES
 #
-function mm_update_coef!(penalty::AbstractPenalty, g::CoefficientSurrogate, v::VertexGLM{<:ALD}, triobs::Vector{TriangleObs}, workspace, caches, opt)
-# Setup local variables to match notation
+function mm_update_coef!(penalty::AbstractPenalty, g::CoefficientSurrogate, v::VertexGLM{<:ALD}, triobs::Vector{TriangleObs}, workspace, caches)
+  # Setup local variables to match notation
   Γ = caches.gamma[v.index]
   d = v.d
   μ = v.mu
   τ = v.family.τ
-  rho = g.rho
-  xi = opt.xi
+  rho = g.opt.rho
+  xi = g.opt.xi
   LHS, RHS, Δ = workspace
-  
+
   fill!(LHS, 0); fill!(RHS, 0)
   itr = zip(eachtriobs(triobs, v), v.part)
-  phi = v.extra_params[:dispersion]
+  phi = v.dispersion
 
   # Update the coefficients using IRWLS
   for ((triidx, T), idxrange) in itr
@@ -81,15 +100,14 @@ function mm_update_coef!(penalty::AbstractPenalty, g::CoefficientSurrogate, v::V
         d[idx] = one(zweight)
         u = zero(zweight)
       end
-      # @assert zweight > 0 "MM Update w/ Zero Weight @ Vertex $(v.index)\n\tObs. Index: $(idx)\n\talpha = $(alpha)\n\tlogf = $(logf)\n\tResidual: $(r[idx])\n\tIRLS Weight: $(stable_irls_weight(family, link, η[idx], μ[idx], dμdη))"
 
       # Evaluate gradient + Hessian
       if v.nvar > 1
-        BLAS.axpy!(d[idx]*u, x, RHS)
+        BLAS.axpy!(d[idx] * u, x, RHS)
         BLAS.syr!('U', d[idx], x, LHS)
       else
         RHS[1] = RHS[1] - d[idx] * u * x[1]
-        LHS[1] = LHS[1] + d[idx] * x[1]*x[1]
+        LHS[1] = LHS[1] + d[idx] * x[1] * x[1]
       end
     end
   end
@@ -100,17 +118,20 @@ function mm_update_coef!(penalty::AbstractPenalty, g::CoefficientSurrogate, v::V
   else
     Δ[1] = RHS[1] / LHS[1]
   end
-  @. v.beta_new = v.beta - Δ
+  linesearch!(g, v.beta_new, v.beta, Δ, g.opt.backtrack)
+  return v
 end
 
 function mm_update_disp!(::ALD, g::DispersionSurrogate, v::VertexGLM, triobs::Vector{TriangleObs}, workspace, caches)
   # Setup local variables to match notation
-  μ = v.mu
+  mu = v.mu
+  nu = g.opt.nu
+  avgphi = caches.avgphi[v.index]
 
   itr = zip(eachtriobs(triobs, v), v.part)
 
   # Fix β, update φ
-  num = den = zero(eltype(v.beta))
+  rss = n_j = zero(eltype(v.beta))
   for ((triidx, T), idxrange) in itr
     y, A, t = T.y, T.A, get_triangle_vertices(T, v.index)
     F = caches.logf[triidx]
@@ -118,49 +139,36 @@ function mm_update_disp!(::ALD, g::DispersionSurrogate, v::VertexGLM, triobs::Ve
       alpha = @get_triple A i
       logf = @get_triple F i
       zweight = stable_convex_weight(t, alpha, logf)
-      num += zweight * deviance(v.family, y[i], μ[idx])
-      den += zweight
-      # v.index == 1 && @show zweight, deviance(v.family, y[i], μ[idx])
+      rss += zweight * deviance(v.family, y[i], mu[idx])
+      n_j += zweight
     end
   end
 
-  if g.use_prior
-    phi0 = v.extra_params[:global_dispersion]
-    nu = v.extra_params[:nu]
-    if !isempty(v.triangles)
-      phi = (den + nu) / (num + nu / phi0)
-    else
-      phi = phi0
-    end
+  a = nu * (1 + 2*sum(v.weights))
+  b = 2 * nu * dot(avgphi, v.weights) - rss
+  c = n_j + nu
+  phi1 = (b + sqrt(b*b + 4*a*c)) / (2*a)
+  phi2 = (b - sqrt(b*b + 4*a*c)) / (2*a)
+  if phi2 > 0
+    phi = g(phi1) < g(phi2) ? phi1 : phi2
   else
-    nu = v.extra_params[:nu]
-    B = zero(den)
-    for (idx, k) in enumerate(v.neighbors)
-      u = g.model.vertex[k]
-      B_k = u.extra_params[:local_dispersion]
-      B += v.weights[idx] * inv(B_k)
-    end
-    phi = (den + nu) / (num + nu * B)
+    phi = phi1
   end
-
-  # phi_old = v.extra_params[:dispersion]
-  # g_prev = g(phi_old)
-  # g_curr = g(phi)
-  # @assert g_curr < g_prev || abs(g_curr - g_prev) < sqrt(eps()) * (1 + abs(g_prev)) "\n\tVertex: $(v.index)\n\tNobs: $(v.nobs)\n\tPrevious: $(g_prev)\n\t Current: $(g_curr)\n\tDen/Num: $(den) / $(num)\n\tφ₀: $(phi_old)\n\tφ: $(phi)\n\tβ: $(v.beta)"
-
-  v.extra_params[:dispersion] = isinf(phi) ? one(phi) : phi
+  v = Accessors.@set v.dispersion = phi
+  return v
 end
 
 function fitqreg(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
     maxiter::Int = 100,
+    backtrack::Int = 5,
     tol::Real = 1e-3,
     rho::Real = 1.0,
+    nu::Real = 1.0,
     quantile::Real = 0.5,
     smooth_max::Real = 10.0,
     smooth_min::Real = 0.1,
     smooth_itr::Real = 20,
     nchunks::Int = Threads.nthreads(),
-    use_prior::Bool = false,
     verbose::Bool = false,
     kwargs...
     # intercept = all(isequal(1), view(Xfull, :, 1)),
@@ -170,17 +178,14 @@ function fitqreg(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
   family, link = ALD(tau), IdentityLink() # need to propagate tau!
   VT = infer_vertex_type(VertexGLM, family, link; kwargs...)
   model = f = create_model(VT, yfull, Xfull, Sfull, tri; nchunks, family, link, kwargs...)
-  update_phi = needs_dispersion(family)
-  # initialize_coefficients!(model.triobs, model.vertex)
   update_caches!(model; nchunks)
-  update_phi && update_pooling!(model, use_prior)
 
   # Main loop
-  nlogl = f(rho; nchunks, use_prior)
+  nlogl = f(rho, nu; nchunks)
   nlogl_prev = zero(nlogl)
   iter = 0
   xi = smooth_max
-  opt = (; rho = rho, xi = xi, use_prior = use_prior)
+  opt = (; rho = rho, nu = nu, xi = xi, backtrack = backtrack)
   while iter < maxiter && abs(nlogl - nlogl_prev) > (1 + abs(nlogl_prev)) * tol
     iter += 1
 
@@ -188,27 +193,25 @@ function fitqreg(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
     update_coefficients!(model, opt, nchunks)
     
     # Visit each vertex once to update auxiliary parameters
-    update_phi && update_dispersion!(model, opt, nchunks)
+    update_caches!(model; nchunks)
+    update_dispersion!(model, opt, nchunks)
 
     # Synchronize algorithm state and evaluate current model
     xi = iter > smooth_itr ? smooth_min : smooth_max * (smooth_min / smooth_max) ^ (iter / smooth_itr)
-    opt = (; rho = rho, xi = xi, use_prior = use_prior)
+    opt = (; rho = rho, nu = nu, xi = xi, backtrack = backtrack)
     update_caches!(model; nchunks)
-    update_phi && update_pooling!(model, use_prior)
 
     # Check convergence
     nlogl_prev = nlogl
-    nlogl = f(rho; nchunks, use_prior)
+    nlogl = f(opt.rho, opt.nu; nchunks)
     verbose && @show iter, nlogl, nlogl_prev - nlogl
     @assert is_approx_decrease(nlogl, nlogl_prev, sqrt(eps()))
   end
 
   # Apply all updates
-  if update_phi
-    for v in eachvertex(model)
-      phi = v.extra_params[:dispersion]
-      v.extra_params[:dispersion] = 1 / phi
-    end
+  for v in eachvertex(model)
+    phi = v.dispersion
+    model.vertex[v.index] = Accessors.@set v.dispersion = 1 / phi
   end
 
   return iter, model, nlogl
