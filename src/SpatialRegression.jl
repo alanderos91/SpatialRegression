@@ -26,6 +26,11 @@ include("GLMUtilities.jl")
 include("utilities.jl")
 using .GLMUtilities
 
+# Export adaptive refinement tools
+include("AdaptiveRefinement.jl")
+import .AdaptiveRefinement
+export AdaptiveRefinement
+
 abstract type AbstractVertexModel end
 abstract type AbstractPenalty end
 abstract type AbstractSpatialModel end
