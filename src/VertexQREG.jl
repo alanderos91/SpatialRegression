@@ -176,8 +176,22 @@ function fitqreg(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
   # Initialize
   tau = quantile
   family, link = ALD(tau), IdentityLink() # need to propagate tau!
-  VT = infer_vertex_type(VertexGLM, family, link; kwargs...)
-  model = f = create_model(VT, yfull, Xfull, Sfull, tri; nchunks, family, link, kwargs...)
+  VT = infer_vertex_type(VertexGLM, family, link)
+  model = create_model(VT, yfull, Xfull, Sfull, tri; nchunks, family, link, kwargs...)
+
+  opt = (;
+    rho, nu, xi = zero(rho), backtrack, verbose, nchunks,
+    smooth_max, smooth_min, smooth_itr # unique to QREG
+  )
+  _fitqreg_loop_(model, maxiter, tol, opt)
+end
+
+function _fitqreg_loop_(model::SpatialVertexModel{V}, maxiter, tol, opt) where V <: VertexGLM
+  # unpacking + convenient definitions
+  rho, nu, verbose, nchunks = opt.rho, opt.nu, opt.verbose, opt.nchunks
+  smooth_max, smooth_min, smooth_itr = opt.smooth_max, opt.smooth_min, opt.smooth_itr
+  f = model
+
   update_caches!(model; nchunks)
 
   # Main loop
@@ -185,7 +199,8 @@ function fitqreg(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
   nlogl_prev = zero(nlogl)
   iter = 0
   xi = smooth_max
-  opt = (; rho = rho, nu = nu, xi = xi, backtrack = backtrack)
+  opt = (; opt..., xi = typeof(opt.xi)(xi))
+
   while iter < maxiter && abs(nlogl - nlogl_prev) > (1 + abs(nlogl_prev)) * tol
     iter += 1
 
@@ -198,21 +213,18 @@ function fitqreg(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
 
     # Synchronize algorithm state and evaluate current model
     xi = iter > smooth_itr ? smooth_min : smooth_max * (smooth_min / smooth_max) ^ (iter / smooth_itr)
-    opt = (; rho = rho, nu = nu, xi = xi, backtrack = backtrack)
+    opt = (; opt..., xi = typeof(opt.xi)(xi))
     update_caches!(model; nchunks)
 
     # Check convergence
     nlogl_prev = nlogl
-    nlogl = f(opt.rho, opt.nu; nchunks)
+    nlogl = f(rho, nu; nchunks)
     verbose && @show iter, nlogl, nlogl_prev - nlogl
     @assert is_approx_decrease(nlogl, nlogl_prev, sqrt(eps()))
   end
 
   # Apply all updates
-  for v in eachvertex(model)
-    phi = v.dispersion
-    model.vertex[v.index] = Accessors.@set v.dispersion = 1 / phi
-  end
+  transform_parameters!(model)
 
   return iter, model, nlogl
 end

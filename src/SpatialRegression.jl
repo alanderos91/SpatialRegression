@@ -25,6 +25,7 @@ import ChunkSplitters: is_chunkable
 include("GLMUtilities.jl")
 include("utilities.jl")
 using .GLMUtilities
+import .GLMUtilities: needs_dispersion
 
 # Export adaptive refinement tools
 include("AdaptiveRefinement.jl")

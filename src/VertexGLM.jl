@@ -18,12 +18,31 @@ struct VertexGLM{D <: UnivariateDistribution, L <: Link} <: AbstractVertexModel
   dispersion::Float64         # may be transformed while fitting
 end
 
-infer_vertex_type(::Type{VertexGLM}, ::D, ::L; kwargs...) where {D <: UnivariateDistribution, L <: Link} = VertexGLM{D,L}
+# convenience accesors to hide implementation details
+get_family(v::VertexGLM) = v.family
+get_link(v::VertexGLM) = v.link
+needs_dispersion(v::VertexGLM) = needs_dispersion(get_family(v))
+
+get_family(model::SpatialVertexModel{V}) where V <: VertexGLM = get_family(first(model.vertex))
+get_link(model::SpatialVertexModel{V}) where V <: VertexGLM = get_link(first(model.vertex))
+needs_dispersion(model::SpatialVertexModel{V}) where V <: VertexGLM = needs_dispersion(first(model.vertex))
+
+infer_vertex_type(::Type{VertexGLM}, ::D, ::L) where {D <: UnivariateDistribution, L <: Link} = VertexGLM{D,L}
+
+function transform_parameters!(model::SpatialVertexModel{V}) where V <: VertexGLM
+  if needs_dispersion(model)
+    for v in eachvertex(model)
+      phi = v.dispersion
+      model.vertex[v.index] = Accessors.@set v.dispersion = 1 / phi
+    end
+  end
+end
 
 function create_vertex(::Type{VertexGLM{D,L}}, index, part, triangles, neighbors, weights, nobs, nvar;
   family::D = Normal(),
   link::L   = IdentityLink(),
-  kwargs...) where {D <: UnivariateDistribution, L <: Link}
+  ) where {D <: UnivariateDistribution, L <: Link}
+  #
   d = zeros(nobs)
   beta = zeros(nvar)
   beta_new = similar(beta)
@@ -278,17 +297,28 @@ function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
     # intercept = all(isequal(1), view(Xfull, :, 1)),
   ) where {D <: UnivariateDistribution, L <: Link}
   # Initialize
-  VT = infer_vertex_type(VertexGLM, family, link; kwargs...)
-  model = f = create_model(VT, yfull, Xfull, Sfull, tri; nchunks, family, link, kwargs...)
-  update_phi = needs_dispersion(family)
+  VT = infer_vertex_type(VertexGLM, family, link)
+  model = create_model(VT, yfull, Xfull, Sfull, tri; nchunks, family, link, kwargs...)
   initialize!(model)
+
+  opt = (; rho, nu, xi = zero(rho), backtrack, verbose, nchunks)
+  _fitmodel_loop_(model, maxiter, tol, opt)
+end
+
+function _fitmodel_loop_(model::SpatialVertexModel{V}, maxiter, tol, opt) where V <: VertexGLM
+  # unpacking + convenient definitions
+  rho, nu, verbose, nchunks = opt.rho, opt.nu, opt.verbose, opt.nchunks
+  family = get_family(model)
+  f = model
+
+  update_phi = needs_dispersion(family)
   update_caches!(model; nchunks)
 
   # Main loop
   nlogl = f(rho, nu; nchunks)
   nlogl_prev = zero(nlogl)
   iter = 0
-  opt = (; rho = rho, nu = nu, xi = zero(rho), backtrack = backtrack)
+
   while iter < maxiter && abs(nlogl - nlogl_prev) > (1 + abs(nlogl_prev)) * tol
     iter += 1
 
@@ -304,18 +334,13 @@ function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
 
     # Check convergence
     nlogl_prev = nlogl
-    nlogl = f(opt.rho, opt.nu; nchunks)
+    nlogl = f(rho, nu; nchunks)
     verbose && @show iter, nlogl, nlogl_prev - nlogl
     @assert is_approx_decrease(nlogl, nlogl_prev, sqrt(eps()))
   end
 
-  # Apply all updates
-  if update_phi
-    for v in eachvertex(model)
-      phi = v.dispersion
-      model.vertex[v.index] = Accessors.@set v.dispersion = 1 / phi
-    end
-  end
+  # Transform parameters as needed
+  transform_parameters!(model)
 
   return iter, model, nlogl
 end
