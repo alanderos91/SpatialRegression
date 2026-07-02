@@ -163,7 +163,8 @@ function plot_fitted(datasets; markersize = 4.0, kwargs...)
     y, X, S, mesh = load_data(dataset_name*".jld2", "y", "X", "S", "mesh")
 
     # Update minimum and maximum values for color scale
-    cr[] = (minimum(y), maximum(y))
+    ymin, ymax = cr[]
+    cr[] = (min(minimum(y), ymin), max(maximum(y), ymax))
 
     # Add a row label with triangulation characteristics
     Label(fig[1,1+j], get_tri_title(mesh), font = :bold, fontsize = LABEL_FONTSIZE, tellwidth = false)
@@ -181,7 +182,8 @@ function plot_fitted(datasets; markersize = 4.0, kwargs...)
         Label(fig[2+k,1], metadata.penalty_name, font = :bold, fontsize = LABEL_FONTSIZE, rotation = pi/2, tellheight = false)
       end
       yhat = SpatialRegression.predict(X, S, model, mesh; kind = :mean)
-      cr[] = (minimum(yhat), maximum(yhat))
+      ymin, ymax = cr[]
+      cr[] = (min(minimum(yhat), ymin), max(maximum(yhat), ymax))
       ax = Axis(fig[2+k,1+j])
       scatter!(ax, S[1,:], S[2,:]; color = yhat, colormap = cmap, colorrange = cr, markersize, rasterize = SCALE_FACTOR, kwargs...)
     end
