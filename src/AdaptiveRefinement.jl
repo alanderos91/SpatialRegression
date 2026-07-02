@@ -17,7 +17,7 @@ end
 function derive_lower_bound(nnt)
   _, d = allnn(nnt)
   mask = @. !iszero(d)
-  return minimum(d[mask])
+  return pi*minimum(d[mask])^2
 end
 
 function (field::SizingField)(x, y)
@@ -28,50 +28,56 @@ end
 
 struct AdaptiveDataConstraint{F,T}
   field::F
-  min_area::T
+  lb::T
   scaling::T
 end
 
 function build_constraint(data;
-  min_area::Real = 0.0,
+  lb::Real = 0.0,
   scaling::Real = 0.05,
   kwargs...)
 
   # Sanity check on sizing field parameters
-  @assert min_area >= 0
+  @assert lb >= 0
   @assert scaling >= 0
 
-  # Build SizingField from data
   field = build_sizing_field(data; kwargs...)
+  build_constraint(field; lb, scaling)
+end
+
+function build_constraint(field::SizingField;
+  lb::Real = 0.0,
+  scaling::Real = 0.05)
+
+  # Sanity check on sizing field parameters
+  @assert lb >= 0
+  @assert scaling >= 0
 
   # No minimum area => derive a lower bound from the data
-  if iszero(min_area)
-    lb = derive_lower_bound(field.knn)
-  else
-    lb = min_area
-  end
-
-  # Default scaling to scale of coordinates in data
   T = NearestNeighbors.dist_type_internal(field.knn)
-  _min_area = T(lb)
+  if iszero(lb)
+    _lb = T(derive_lower_bound(field.knn))
+  else
+    _lb = T(lb)
+  end
   _scaling = T(scaling)
 
-  return AdaptiveDataConstraint(field, _min_area, _scaling)
+  return AdaptiveDataConstraint(field, _lb, _scaling)
 end
 
 # this is what DelaunayTriangulation.jl sees
 function (f::AdaptiveDataConstraint)(tri, T)
-  adaptive_data_constraint(tri, T, f.field, f.min_area, f.scaling)
+  adaptive_data_constraint(tri, T, f.field, f.lb, f.scaling)
 end
 
 # implementation details
-function adaptive_data_constraint(tri, T, field, min_area, scaling)
+function adaptive_data_constraint(tri, T, field, lb, scaling)
   i, j, k = triangle_vertices(T)
   p, q, r = get_point(tri, i, j, k)
   area = DelaunayTriangulation.triangle_area(p, q, r)
-  cx, cy = DelaunayTriangulation.triangle_circumcenter(p, q, r, area)
+  cx, cy = DelaunayTriangulation.triangle_centroid(p, q, r)
 
-  maximum_area = min_area + scaling * field(cx, cy)
+  maximum_area = lb + scaling * pi * field(cx, cy)
   return area >= maximum_area
 end
 
