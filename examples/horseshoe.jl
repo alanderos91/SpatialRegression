@@ -266,7 +266,7 @@ function benchmark_adaptive_refinement(nt, penalty, common_kwargs;
   w::Real=DEFAULT_WIDTH,
   h::Real=DEFAULT_HEIGHT,
   fontsize::Real=12,
-  cmap::Any=Reverse(:berlin))
+  cmap::Any=Reverse(:Spectral))
   # Retrieve grids
   scaling_grid, minimum_grid = nt.scaling_grid, nt.minimum_grid
   m, n = length(scaling_grid), length(minimum_grid)

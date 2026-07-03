@@ -156,7 +156,7 @@ function plot_fitted(datasets; markersize = 4.0, kwargs...)
   fig = Figure(size = (W * NCOL, H * NROW))
   Label(fig[2,1], "Observed", font = :bold, fontsize = LABEL_FONTSIZE, rotation = pi/2, tellheight = false)
 
-  cmap = :berlin
+  cmap = Reverse(:lightrainbow)
   cr = Observable((0.0, 1.0))
   for (j, dataset_name) in enumerate(model_basenames)
     # Retrieve data
