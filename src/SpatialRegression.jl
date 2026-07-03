@@ -8,6 +8,7 @@ using DelaunayTriangulation
 using OhMyThreads: @localize, @tasks, @set, tmap, tforeach, ChannelLike
 using ChunkSplitters
 using GLM: glm, coef, dispersion
+using MLUtils
 
 import Distributions
 import Accessors

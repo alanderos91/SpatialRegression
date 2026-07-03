@@ -344,7 +344,110 @@ function _fitmodel_loop_(model::SpatialVertexModel{V}, maxiter, tol, opt) where 
 
   return iter, model, nlogl
 end
+#
+# CROSS VALIDATION
+#
+function cv(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
+    train_prop::Real = 0.8,
+    nfolds::Int = 5,
+    grid_rho::AbstractVector=[1e-6, 1e-3, 1.0],
+    family::D = Normal(),
+    link::L = IdentityLink(),
+    maxiter::Int = 100,
+    backtrack::Int = 5,
+    tol::Real = 1e-3,
+    nu::Real = 1.0,
+    nchunks::Int = Threads.nthreads(),
+    verbose::Bool = false,
+    kwargs...
+    # intercept = all(isequal(1), view(Xfull, :, 1)),
+  ) where {D <: UnivariateDistribution, L <: Link}
+  # Train-Validate split
+  Ys, Xts, Ss = shuffleobs((yfull, Xfull', Sfull))
+  cv_data, test_data = splitobs((Ys, Xts, Ss); at=train_prop)
+  y_tes, Xt_tes, S_tes = getobs(test_data)
+  X_tes = Xt_tes |> transpose |> Matrix
 
+  # Setup before any CV or model fitting takes place
+  nvals = length(grid_rho)
+  VT = infer_vertex_type(VertexGLM, family, link)
+
+  score_tra = zeros(nvals, nfolds)
+  score_val = zeros(nvals, nfolds)
+  score_tes = zeros(nvals, nfolds)
+
+  niter_tra = zeros(Int, nvals, nfolds)
+  nlogl_tra = zeros(nvals, nfolds)
+
+  times_fit = zeros(nvals, nfolds)
+  times_tra = zeros(nvals, nfolds)
+  times_val = zeros(nvals, nfolds)
+  times_tes = zeros(nvals, nfolds)
+
+  result1 = (score_tra, score_val, score_tes)
+  result2 = (times_tra, times_val, times_tes)
+
+  for (k, (train_data, val_data)) in enumerate(kfolds(cv_data; k=nfolds))
+    # retrieve training and validation data
+    y_tra, Xt_tra, S_tra = getobs(train_data); X_tra = Xt_tra |> transpose |> Matrix
+    y_val, Xt_val, S_val = getobs(val_data);   X_val = Xt_val |> transpose |> Matrix
+    sub = (
+      (y_tra, X_tra, S_tra),
+      (y_val, X_val, S_val),
+      (y_tes, X_tes, S_tes),
+    )
+
+    # Initialize model with training data
+    model = create_model(VT, y_tra, X_tra, S_tra, tri;
+      nchunks, family, link, kwargs...)
+    initialize!(model)
+
+    # Cross validate on penalty strength, rho
+    for (i, rho) in enumerate(grid_rho)
+      println("Fold $(k), rho = $(round(rho, sigdigits=4))")
+      # fit model with target hyperparameter + other fixed parameters
+      opt = (; rho, nu, xi = zero(rho), backtrack, verbose, nchunks)
+      fitstats = @timed _fitmodel_loop_(model, maxiter, tol, opt)
+
+      # record model fit information
+      niter_tra[i,k] = fitstats.value[1]
+      nlogl_tra[i,k] = fitstats.value[3]
+      times_fit[i,k] = fitstats.time
+
+      # score model on different subsets
+      for ((y, X, S), arr1, arr2) in zip(sub, result1, result2)
+        predstats = @timed predict(X, S, model, tri; kind = :mean)
+        yhat = predstats.value
+        arr1[i,k] = mean(abs2, y - yhat) |> sqrt # MSE, replace with MISE?
+        arr2[i,k] = predstats.time
+      end
+    end
+  end
+
+  # assemble results
+  cv_scores = mean(score_val, dims=2) |> vec
+  idx = argmin(cv_scores)
+
+  results = (;
+    # cross validation settings
+    cv_data, test_data, nfolds, train_prop,
+    # cross validation results
+    score_tra, score_val, score_tes,
+    times_fit, niter_tra, nlogl_tra,
+    times_tra, times_val, times_tes,
+    cv_scores,
+    # optimal hyperparameter(s)
+    grid_rho,
+    best_score = cv_scores,
+    best_rho = grid_rho[idx],
+    best_rho_index = idx,
+  )
+
+  return results
+end
+#
+# PREDICTION
+#
 function assemble_mixture(x, s, m, tri, id2vertex, points)
     j, k, l = find_triangle(tri, s; concavity_protection = true) |> sort
     p, q, r = points[j], points[k], points[l]
