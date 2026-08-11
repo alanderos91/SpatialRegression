@@ -47,4 +47,6 @@ export TriangleObs,
 include("penalty.jl")
 export L2Squared, L1Approx
 
+include("bootstrap.jl")
+
 end
