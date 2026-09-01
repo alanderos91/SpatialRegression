@@ -454,6 +454,8 @@ function assemble_mixture(x, s, m, tri, id2vertex, points)
     j, k, l = id2vertex[j], id2vertex[k], id2vertex[l]
     vertex = (m.vertex[j], m.vertex[k], m.vertex[l])
     alpha = barycentric(s, [p[1] q[1] r[1]; p[2] q[2] r[2]])
+    clamp!(alpha, 1e-12, 1.0)
+    alpha .= alpha / sum(alpha)
     return MixtureModel(
       [create_component(v.family, v.link, dot(x, v.beta), v.dispersion) for v in vertex],
       alpha
