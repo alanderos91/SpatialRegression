@@ -2,6 +2,7 @@
 ArchGDAL = "c9ce4bd3-c3d5-55b8-8973-c0e20141b8c3"
 Arrow = "69666777-d1a9-59fb-9406-91d4454c9d45"
 CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
 CategoricalArrays = "324d7699-5711-5eae-9e2f-1d82baa6b597"
 DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
 DelaunayTriangulation = "927a84f5-c5f4-47a5-9785-b46e178433df"

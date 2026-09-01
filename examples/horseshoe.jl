@@ -48,6 +48,26 @@ function boundary(; r0=DEF_R0, r=DEF_R, l=DEF_L, ntheta=DEF_NTHETA)
   return (;x=x, y=y)
 end
 
+function boundary_curve(; r0=DEF_R0, r=DEF_R, l=DEF_L)
+  rr = r + (r - r0)
+  c0 = (0.0, 0.0)
+  cu = (l, +r)
+  cl = (l, -r)
+
+  boundary_nodes = [
+      LineSegment((  l, +rr), (0.0, +rr), l),
+      CircularArc((0.0, +rr), (0.0, -rr), c0; positive=true),
+      LineSegment((0.0, -rr), (  l, -rr), l),
+      CircularArc((  l, -rr), (  l, -r0), cl; positive=true),
+      LineSegment((  l, -r0), (0.0, -r0), l),
+      CircularArc((0.0, -r0), (0.0, +r0), c0; positive=false),
+      LineSegment((0.0, +r0), (  l, +r0), l),
+      CircularArc((  l, +r0), (  l, +rr), cu),
+  ]
+
+  return boundary_nodes
+end
+
 function test(x, y; r0=DEF_R0, r=DEF_R, l=DEF_L, b=1.0)
   L = π * r / 2
 
@@ -128,23 +148,15 @@ function simulate_data(n; kwargs...)
   return y, X, S
 end
 
-function get_mesh(; data=nothing, kwargs...)
-  fsb = boundary(; kwargs...)
-  boundary_points = [(fsb.x[i], fsb.y[i]) for i in eachindex(fsb.x)]
-  boundary_points[end] = boundary_points[1]
-  boundary_unique = unique(boundary_points)
+function get_mesh(; data=nothing, r0=DEF_R0, r=DEF_R, l=DEF_L, kwargs...)
+  nodes = Horseshoe.boundary_curve(; r0, r, l)
+  init_points = [[l, +r], [0.0, +r], [(-0.1 + -0.9)/2, 0.0], [0.0, -r], [l, -r]]
   if isnothing(data)
-    boundary_nodes, points = convert_boundary_points_to_indices(boundary_points;
-      check_args=true
-    )
+    points = init_points
   else
-    boundary_nodes, points = convert_boundary_points_to_indices(boundary_points;
-      existing_points = copy(data),
-      check_args=true
-    )
+    points = [init_points; data]
   end
-  @assert boundary_nodes[1] ≈ boundary_nodes[end]
-  return triangulate(points; boundary_nodes=reverse(boundary_nodes))
+  return triangulate(Vector{Float64}[]; boundary_nodes = [[r] for r in nodes], kwargs...)
 end
 
 function add_mesh_subplot!(ax, mesh, data)
