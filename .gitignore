@@ -5,4 +5,5 @@ examples/data
 examples/models/*.*
 examples/figures/*.*
 examples/tables/*.*
+examples/vignettes/*.*
 dev/
