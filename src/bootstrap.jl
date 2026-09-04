@@ -30,6 +30,7 @@ function bootstrap(model::SpatialVertexModel{V}, y, X, S, tri, options;
     replicates::Int = 100,
     alpha::Real = 0.05,
     keep::Bool = false,
+    progress = false,
   ) where V <: VertexGLM
   #
   refit && isempty(cv_options) &&
@@ -42,56 +43,51 @@ function bootstrap(model::SpatialVertexModel{V}, y, X, S, tri, options;
   rho_ = refit ? zeros(replicates) : [model.state.rho]
   nu_ = refit ? zeros(replicates) : [model.state.nu]
 
-  alpha_lb = 1 - alpha/2
-  alpha_ub = alpha/2
+  # use parametric bootstrap to generate bootstrap data
   for b in 1:replicates
-    # use parametric bootstrap to generate bootstrap data
-    print("[$(b) / $(replicates)] resample")
-    y_b = @time resample(helper)
-
+    y_b = resample(helper)
+    tbeg = progress ? time() : 0.0
+    r_b = bootstrap_replicate(model, y_b, X, S, tri, cv_options, options, refit)
+    tend = progress ? time() : 0.0
+    progress && println("Replicate $(lpad(b, ndigits(replicates))) / $(replicates): $(rpad(round(tend - tbeg, sigdigits = 4), 5)) seconds")
     if refit
-      # need to determine smoothing parameters w/ cross validation
-      print("[$(b) / $(replicates)] cv      ")
-      results = @time cv(VertexGLM, y_b, X, S, tri;
-        cv_options...,
-        options...,
-        family = get_family(model),
-        link = get_link(model),
-        penalty = model.penalty,
-      )
-      rho_[b] = results.best_rho
-      nu_[b] = results.best_nu
-      print("[$(b) / $(replicates)] fitmodel")
-      niter, model_b, nlogl = @time fitmodel(VertexGLM, y_b, X, S, tri;
-        options...,
-        rho = results.best_rho,
-        nu = results.best_nu,
-        family = get_family(model),
-        link = get_link(model),
-        penalty = model.penalty,
-      )
-    else
-      # conditional bootstrap; here be dragons
-      print("[$(b) / $(replicates)] fitmodel")
-      niter, model_b, nlogl = @time fitmodel(VertexGLM, y_b, X, S, tri; 
-        options...,
-        rho = model.state.rho,
-        nu = model.state.nu,
-        family = get_family(model),
-        link = get_link(model),
-        penalty = model.penalty,
-      )
+      rho_[b] = r_b.model.state.rho
+      nu_[b] = r_b.model.state.rho
     end
-
-    # obtain differences between fitted parameters and bootstrap versions
-    print("[$(b) / $(replicates)] record  ")
-    @time for (j, v_b) in enumerate(eachvertex(model_b))
+    for (j, v_b) in enumerate(eachvertex(r_b.model))
       @. beta_b[:,j,b] = v_b.beta
       scale_b[:,j,b] .= v_b.dispersion
     end
-    println()
   end
-  
+  # compute ci from the bootstrap data
+  beta, scale = bootstrap_ci(model, beta_b, scale_b, alpha, keep)
+  results = (;
+    model, replicates, refit, alpha, beta, scale, rho = rho_, nu = nu_
+  )
+  return results
+end
+
+function bootstrap_replicate(model, y_b, X, S, tri, cv_options, options, refit)
+  # get information from model object
+  family, link, penalty = get_family(model), get_link(model), model.penalty
+  if refit
+    # need to determine smoothing parameters w/ cross validation
+    results = cv(VertexGLM, y_b, X, S, tri;
+      cv_options..., options..., family, link, penalty,
+    )
+    rho_b, nu_b = results.best_rho, results.best_nu
+  else
+    # conditional bootstrap; here be dragons
+    rho_b, nu_b = model.state.rho, model.state.nu
+  end
+  # fit the model
+  niter, model_b, nlogl = fitmodel(VertexGLM, y_b, X, S, tri;
+    options..., family, link, penalty, rho = rho_b, nu = nu_b,
+  )
+  return (; model = model_b, niter, nlogl,)
+end
+
+function bootstrap_ci(model, beta_b, scale_b, alpha, keep)
   # helper to create output
   init_output(x) = (;
     bias = zeros(size(x, 1), size(x, 2)),
@@ -101,11 +97,11 @@ function bootstrap(model::SpatialVertexModel{V}, y, X, S, tri, options;
   )
   beta = init_output(beta_b)
   scale = init_output(scale_b)
+  alpha_lb = 1 - alpha/2
+  alpha_ub = alpha/2
+  itr = ((beta, beta_b, :beta), (scale, scale_b, :dispersion))
   for (j, v) in enumerate(eachvertex(model))
-    itr = ((beta, beta_b, :beta), (scale, scale_b, :dispersion))
     @views for (out, boot, param_name) in itr
-      print("[$(j) / $(nvertices)] $(param_name)")
-      @time begin
       # estimate the bias
       theta_b = mean(boot[:,j,:], dims = 2) |> vec
       theta_est = getfield(v, param_name)
@@ -115,9 +111,7 @@ function bootstrap(model::SpatialVertexModel{V}, y, X, S, tri, options;
       d = boot[:,j,:] .- theta_est
       out.lb[:,j] .= theta_est .- mapslices(row -> quantile(row, alpha_lb), d, dims=2) |> vec
       out.ub[:,j] .= theta_est .- mapslices(row -> quantile(row, alpha_ub), d, dims=2) |> vec
-      end
     end
   end
-  results = (; model, replicates, refit, alpha, beta, scale, rho = rho_, nu = nu_)
-  return results
+  return beta, scale
 end
