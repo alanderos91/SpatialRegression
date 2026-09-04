@@ -302,10 +302,10 @@ function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
   initialize!(model)
 
   opt = (; rho, nu, xi = zero(rho), backtrack, verbose, nchunks)
-  _fitmodel_loop_(model, maxiter, tol, opt)
+  _fitmodel_loop_(model, maxiter, tol, opt, true)
 end
 
-function _fitmodel_loop_(model::SpatialVertexModel{V}, maxiter, tol, opt) where V <: VertexGLM
+function _fitmodel_loop_(model::SpatialVertexModel{V}, maxiter, tol, opt, needs_transform) where V <: VertexGLM
   # unpacking + convenient definitions
   rho, nu, verbose, nchunks = opt.rho, opt.nu, opt.verbose, opt.nchunks
   family = get_family(model)
@@ -340,7 +340,11 @@ function _fitmodel_loop_(model::SpatialVertexModel{V}, maxiter, tol, opt) where 
   end
 
   # Transform parameters as needed
-  transform_parameters!(model)
+  needs_transform && transform_parameters!(model)
+
+  # Make to reflect updated state in model
+  model = Accessors.@set model.state =
+    FittedState(true, needs_transform, rho, nu)
 
   return iter, model, nlogl
 end
@@ -351,26 +355,49 @@ function cv(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
     train_prop::Real = 0.8,
     nfolds::Int = 5,
     grid_rho::AbstractVector=[1e-6, 1e-3, 1.0],
+    grid_nu::AbstractVector=[1.0],
     family::D = Normal(),
     link::L = IdentityLink(),
     maxiter::Int = 100,
     backtrack::Int = 5,
     tol::Real = 1e-3,
-    nu::Real = 1.0,
     nchunks::Int = Threads.nthreads(),
     verbose::Bool = false,
+    penalty::P = L2Squared(),
     kwargs...
     # intercept = all(isequal(1), view(Xfull, :, 1)),
-  ) where {D <: UnivariateDistribution, L <: Link}
-  # Train-Validate split
-  Ys, Xts, Ss = shuffleobs((yfull, Xfull', Sfull))
-  cv_data, test_data = splitobs((Ys, Xts, Ss); at=train_prop)
-  y_tes, Xt_tes, S_tes = getobs(test_data)
-  X_tes = Xt_tes |> transpose |> Matrix
+  ) where {D <: UnivariateDistribution, L <: Link, P <: AbstractPenalty}
+  # Extract vertex data so we can quickly build up TriangleObs sets
+  helper = create_triobs_helper(tri)
+  tri_vertex_coords = DelaunayTriangulation.get_points(tri)
+
+  # Shuffle data, then split data into CV subset and test subset.
+  n = length(yfull)
+  idx_shuffle = shuffleobs(1:n)
+  aa, bb = splitobs(n; at = train_prop)
+  idx_cv, idx_tes = getobs(idx_shuffle, aa), getobs(idx_shuffle, bb)
+
+  # Buffers to help us materialize data.
+  # We do our best to minimize the memory footprint.
+  tmp_tra, tmp_val = kfolds(length(idx_cv), nfolds)
+  max_size_tra = maximum(length, tmp_tra)
+  max_size_val = maximum(length, tmp_val)
+  max_size_tes = length(idx_tes)
+  n_buf = max(max_size_tra, max_size_val, max_size_tes)
+  y_tmp = similar(yfull, n_buf)
+  y_buf = similar(yfull, n_buf)
+  X_buf = similar(Xfull, (n_buf, size(Xfull, 2)))
+  S_buf = similar(Sfull, (size(Sfull, 1), n_buf))
+  dst = (y_buf, X_buf, S_buf)
+  src = (yfull, Xfull, Sfull)
 
   # Setup before any CV or model fitting takes place
-  nvals = length(grid_rho)
+  itr = Iterators.product(grid_rho, grid_nu)
+  nvals = length(itr)
+  nvar = size(Xfull, 2)
   VT = infer_vertex_type(VertexGLM, family, link)
+  PT = create_component(family, link, 0.0, 1.0) |> typeof
+  buffers = (Vector{PT}(undef, 3), zeros(3))
 
   score_tra = zeros(nvals, nfolds)
   score_val = zeros(nvals, nfolds)
@@ -387,27 +414,26 @@ function cv(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
   result1 = (score_tra, score_val, score_tes)
   result2 = (times_tra, times_val, times_tes)
 
-  for (k, (train_data, val_data)) in enumerate(kfolds(cv_data; k=nfolds))
-    # retrieve training and validation data
-    y_tra, Xt_tra, S_tra = getobs(train_data); X_tra = Xt_tra |> transpose |> Matrix
-    y_val, Xt_val, S_val = getobs(val_data);   X_val = Xt_val |> transpose |> Matrix
-    sub = (
-      (y_tra, X_tra, S_tra),
-      (y_val, X_val, S_val),
-      (y_tes, X_tes, S_tes),
-    )
+  for (k, (idx_tra, idx_val)) in enumerate(kfolds(idx_cv; k=nfolds))
+    # iterator specifying each of the three subsets
+    sub = (idx_tra, idx_val, idx_tes)
+
+    # retrieve training data
+    y_tra, X_tra, S_tra = materialize_data!(dst, src, idx_tra)
 
     # Initialize model with training data
-    model = create_model(VT, y_tra, X_tra, S_tra, tri;
-      nchunks, family, link, kwargs...)
+    triobs = _create_triobs_set_with_helper_(helper, y_tra, X_tra, S_tra, tri, nchunks)
+    vertex = create_vertex_set(VT, tri, triobs, nvar; family, link, kwargs...)
+    caches = build_caches(triobs, vertex, penalty, nvar, nchunks)
+    model = SpatialVertexModel(triobs, vertex, penalty, caches)
     initialize!(model)
 
     # Cross validate on penalty strength, rho
-    for (i, rho) in enumerate(grid_rho)
-      println("Fold $(k), rho = $(round(rho, sigdigits=4))")
+    for (i, (rho, nu)) in enumerate(itr)
+      verbose && println("Fold $(k), rho = $(round(rho, sigdigits=4)), nu = $(round(nu, sigdigits=4))")
       # fit model with target hyperparameter + other fixed parameters
-      opt = (; rho, nu, xi = zero(rho), backtrack, verbose, nchunks)
-      fitstats = @timed _fitmodel_loop_(model, maxiter, tol, opt)
+      opt = (; rho, nu, xi = zero(rho), backtrack, verbose=false, nchunks)
+      fitstats = @timed _fitmodel_loop_(model, maxiter, tol, opt, false)
 
       # record model fit information
       niter_tra[i,k] = fitstats.value[1]
@@ -415,10 +441,12 @@ function cv(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
       times_fit[i,k] = fitstats.time
 
       # score model on different subsets
-      for ((y, X, S), arr1, arr2) in zip(sub, result1, result2)
-        predstats = @timed predict(X, S, model, tri; kind = :mean)
-        yhat = predstats.value
-        arr1[i,k] = mean(abs2, y - yhat) |> sqrt # MSE, replace with MISE?
+      for (idx, arr1, arr2) in zip(sub, result1, result2)
+        y, X, S = materialize_data!(dst, src, idx)
+        yhat = view(y_tmp, 1:length(y))
+        predstats = @timed _predict!_(yhat, X, S, model, tri, helper.id2loc, tri_vertex_coords, :mean, buffers)
+        @. yhat = y - yhat
+        arr1[i,k] = mean(abs2, yhat) |> sqrt # MSE, replace with MISE?
         arr2[i,k] = predstats.time
       end
     end
@@ -427,10 +455,13 @@ function cv(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
   # assemble results
   cv_scores = mean(score_val, dims=2) |> vec
   idx = argmin(cv_scores)
+  itr_size = (length(grid_rho), length(grid_nu))
+  car2lin = CartesianIndices(itr_size)[idx] |> Tuple
 
+  best_rho, best_nu = Iterators.drop(Iterators.take(itr, idx), idx-1) |> Iterators.only
   results = (;
     # cross validation settings
-    cv_data, test_data, nfolds, train_prop,
+    idx_cv, idx_tes, nfolds, train_prop,
     # cross validation results
     score_tra, score_val, score_tes,
     times_fit, niter_tra, nlogl_tra,
@@ -438,13 +469,41 @@ function cv(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
     cv_scores,
     # optimal hyperparameter(s)
     grid_rho,
+    grid_nu,
     best_score = cv_scores,
-    best_rho = grid_rho[idx],
-    best_rho_index = idx,
+    best_rho,
+    best_rho_index = first(car2lin),
+    best_nu,
+    best_nu_index = last(car2lin),
   )
 
   return results
 end
+
+# Helper functions to materialize data from (y, X, S) tuples
+function materialize_data!(dst, src, idx, obsdim)
+  src_lazy = obsview(src, idx, obsdim)
+  n = length(src_lazy)
+  src_view = _get_view_(src_lazy, n, obsdim)
+  dst_view = _get_view_(dst, n, obsdim)
+  dst_view .= src_view
+  return dst_view
+end
+
+function materialize_data!(dst, src, idx)
+  y_ = materialize_data!(dst[1], src[1], idx, ObsDim(1))
+  X_ = materialize_data!(dst[2], src[2], idx, ObsDim(1))
+  S_ = materialize_data!(dst[3], src[3], idx, ObsDim(2))
+  return y_, X_, S_
+end
+
+# Always guarantee linear indexing to ensure BLAS/LAPACK work
+_get_view_(dst::MLUtils.ArrayObsView{1,<:Vector,<:AbstractVector}, _, _) = view(dst.data, dst.indices)
+_get_view_(dst::MLUtils.ArrayObsView{1,<:Matrix,<:AbstractVector}, _, _) = view(dst.data, dst.indices, :)
+_get_view_(dst::MLUtils.ArrayObsView{2,<:Matrix,<:AbstractVector}, _, _) = view(dst.data, :, dst.indices)
+_get_view_(dst::Vector, n, ::ObsDim{1}) = view(dst, 1:n)
+_get_view_(dst::Matrix, n, ::ObsDim{1}) = view(dst, 1:n, :)
+_get_view_(dst::Matrix, n, ::ObsDim{2}) = view(dst, :, 1:n)
 #
 # PREDICTION
 #
@@ -473,15 +532,41 @@ function assemble_mixture(family, link, x, s, B, Φ, tri, id2vertex, points)
     )
 end
 
+function _assemble_mixture_(x, s, m, tri, id2vertex, points, buffers)
+  prob, alpha = buffers
+  j, k, l = find_triangle(tri, s; concavity_protection = true) |> sort
+  p, q, r = points[j], points[k], points[l]
+  j, k, l = id2vertex[j], id2vertex[k], id2vertex[l]
+  vertex = (m.vertex[j], m.vertex[k], m.vertex[l])
+  barycentric!(alpha, s, [p[1] q[1] r[1]; p[2] q[2] r[2]])
+  clamp!(alpha, 1e-12, 1.0)
+  alpha .= alpha / sum(alpha)
+  for (i, v) in enumerate(vertex)
+    prob[i] = create_component(v.family, v.link, dot(x, v.beta), v.dispersion)
+  end
+  return MixtureModel(prob, alpha)
+end
+
 function predict(X, S, m::SpatialVertexModel, tri; kind = :mean)
+  yhat = zeros(size(X, 1))
+  tmp = create_component(get_family(m), get_link(m), 0.0, 1.0)
+  T = typeof(tmp)
+  buffers = (Vector{T}(undef, 3), zeros(3))
+  predict!(yhat, X, S, m, tri, buffers; kind)
+end
+
+function predict!(yhat, X, S, m, tri, buffers; kind = :mean)
   indices = each_solid_vertex(tri) |> collect |> sort
   id2vertex = Dict{Int,Int}(id => j for (j, id) in enumerate(indices))
   points = get_points(tri)
-  yhat = zeros(size(X, 1))
+  _predict!_(yhat, X, S, m, tri, id2vertex, points, kind, buffers)
+end
+
+function _predict!_(yhat, X, S, m, tri, id2vertex, points, kind, buffers)
   @views for i in axes(X, 1)
     s = S[:, i]
     x = X[i, :]
-    h = assemble_mixture(x, s, m, tri, id2vertex, points)
+    h = _assemble_mixture_(x, s, m, tri, id2vertex, points, buffers)
     
     yhat[i] = if kind == :mean
       mean(h)

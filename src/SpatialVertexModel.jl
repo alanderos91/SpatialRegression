@@ -1,8 +1,21 @@
+struct FittedState
+  is_fitted::Bool
+  is_transformed::Bool
+  rho::Float64
+  nu::Float64
+end
+
 struct SpatialVertexModel{V <: AbstractVertexModel, P <: AbstractPenalty, C} <: AbstractSpatialModel
   triobs::Vector{TriangleObs}
   vertex::Vector{V}
   penalty::P
   caches::C
+  state::FittedState
+end
+
+function SpatialVertexModel(triobs, vertex, penalty, caches)
+  state = FittedState(false, false, 0.0, 0.0)
+  return SpatialVertexModel(triobs, vertex, penalty, caches, state)
 end
 
 function create_vertex_set(

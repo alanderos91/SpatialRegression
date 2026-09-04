@@ -25,16 +25,22 @@ end
 # Assumes (y, X, S) are the data used to fit the model
 #
 function bootstrap(model::SpatialVertexModel{V}, y, X, S, tri, options;
-    refit::Bool = false,
-    replicates::Int = 1000,
+    cv_options::NamedTuple = (;),
+    refit::Bool = true,
+    replicates::Int = 100,
     alpha::Real = 0.05,
     keep::Bool = false,
   ) where V <: VertexGLM
   #
+  refit && isempty(cv_options) &&
+    throw(ArgumentError("Using `refit = true` requires careful consideration of cross validation settings. Reference `?SpatialRegression.cv` and specify settings with `cv_options = (<key> = <value>, ...)`."))
+
   nvertices = length(model.vertex)
   helper = create_resampler(model, X, S, tri)
   beta_b = zeros(size(X, 2), nvertices, replicates)
   scale_b = zeros(1, nvertices, replicates)
+  rho_ = refit ? zeros(replicates) : [model.state.rho]
+  nu_ = refit ? zeros(replicates) : [model.state.nu]
 
   alpha_lb = 1 - alpha/2
   alpha_ub = alpha/2
@@ -45,11 +51,36 @@ function bootstrap(model::SpatialVertexModel{V}, y, X, S, tri, options;
 
     if refit
       # need to determine smoothing parameters w/ cross validation
-      error("Not yet implemented.")
+      print("[$(b) / $(replicates)] cv      ")
+      results = @time cv(VertexGLM, y_b, X, S, tri;
+        cv_options...,
+        options...,
+        family = get_family(model),
+        link = get_link(model),
+        penalty = model.penalty,
+      )
+      rho_[b] = results.best_rho
+      nu_[b] = results.best_nu
+      print("[$(b) / $(replicates)] fitmodel")
+      niter, model_b, nlogl = @time fitmodel(VertexGLM, y_b, X, S, tri;
+        options...,
+        rho = results.best_rho,
+        nu = results.best_nu,
+        family = get_family(model),
+        link = get_link(model),
+        penalty = model.penalty,
+      )
     else
       # conditional bootstrap; here be dragons
       print("[$(b) / $(replicates)] fitmodel")
-      niter, model_b, nlogl = @time fitmodel(VertexGLM, y_b, X, S, tri; options...)
+      niter, model_b, nlogl = @time fitmodel(VertexGLM, y_b, X, S, tri; 
+        options...,
+        rho = model.state.rho,
+        nu = model.state.nu,
+        family = get_family(model),
+        link = get_link(model),
+        penalty = model.penalty,
+      )
     end
 
     # obtain differences between fitted parameters and bootstrap versions
@@ -87,6 +118,6 @@ function bootstrap(model::SpatialVertexModel{V}, y, X, S, tri, options;
       end
     end
   end
-  results = (; model, replicates, refit, alpha, beta, scale)
+  results = (; model, replicates, refit, alpha, beta, scale, rho = rho_, nu = nu_)
   return results
 end

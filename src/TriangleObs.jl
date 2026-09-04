@@ -40,6 +40,36 @@ struct TriangleObs
   end
 end
 
+function Base.show(io::IO, tobs::TriangleObs)
+  T = tobs.triangle
+  n, p = size(tobs.X)
+  print(io, "Triangle $(T)\n")
+  print(io, "  number of samples: $(n)\n")
+  print(io, "  number of features: $(p)\n")
+end
+
+struct TriangleObsHelper
+  idx::Vector{Int}
+  loc::Vector{NTuple{2,Float64}}
+  id2loc::Dict{Int,Int}
+end
+
+function create_triobs_helper(tri)
+  # Get points + mapping to solid vertices.
+  # The mapping is needed to ensure vertex label = index into some array
+  idx = each_solid_vertex(tri) |> collect |> sort
+  loc = Vector{NTuple{2,Float64}}(undef, length(idx))
+  id2loc = Dict{Int,Int}()
+
+  # Matrix of vertices, stored along columns
+  for (j, id) in enumerate(idx)
+    v = DelaunayTriangulation.get_point(tri, id)
+    loc[j] = (v[1], v[2])
+    id2loc[id] = j
+  end
+  return TriangleObsHelper(idx, loc, id2loc)
+end
+
 """
     create_triobs_set(y, X, S, tri::Triangulation; nchunks::Int = Threads.nthreads())
 
@@ -60,33 +90,8 @@ This effectively assigns each observation to a unique triangle within triangulat
   The default references the result of `Threads.nthreads()`.
 """
 function create_triobs_set(y, X, S, tri::Triangulation; nchunks::Int = Threads.nthreads())
-  # Get points + mapping to solid vertices.
-  # The mapping is needed to ensure vertex label = index into some array
-  indices = each_solid_vertex(tri) |> collect |> sort
-  vertex = [[get_point(tri, v)...] for v in indices]
-  points = get_points(tri) # should probably save the coordinates, too
-  id2vertex = Dict{Int,Int}()
-
-  # Matrix of vertices, stored along columns
-  V = Matrix{Float64}(undef, 2, length(vertex))
-  for (j, id) in enumerate(indices)
-    V[:, j] .= vertex[j] # points[id]
-    id2vertex[id] = j
-  end
-
-  # Assign each observation to a triangle in parallel
-  nonempty_triangles, tri2idx = _assign_data_to_triangles(tri, id2vertex, S, nchunks)
-
-  # Create TriangleObs for each 'active' triangle
-  triobs = Vector{TriangleObs}(undef, nonempty_triangles)
-  for (i, (triidx, idx)) in enumerate(tri2idx)
-    sort!(idx) # mitigate random access patterns as much as possible
-    Vₜ = V[:, [triidx[1], triidx[2], triidx[3]]]
-    Sₜ = S[:, idx]
-    Aₜ = barycentric(Sₜ, Vₜ)
-    triobs[i] = TriangleObs(triidx, idx, y[idx], X[idx, :], Sₜ, Aₜ, Vₜ)
-  end
-
+  helper = create_triobs_helper(tri)
+  triobs = _create_triobs_set_with_helper_(helper, y, X, S, tri, nchunks)
   return triobs
 end
 
@@ -123,6 +128,25 @@ function _assign_data_to_triangles(tri, id2vertex, S, nchunks)
   nonempty_triangles = length(keys(tri2idx))
 
   return nonempty_triangles, tri2idx
+end
+
+function _create_triobs_set_with_helper_(helper, y, X, S, tri, nchunks)
+  vertex = helper.loc
+  id2loc = helper.id2loc
+
+  # Assign each observation to a triangle in parallel
+  nonempty_triangles, tri2idx = _assign_data_to_triangles(tri, id2loc, S, nchunks)
+
+  # Create TriangleObs for each 'active' triangle
+  triobs = Vector{TriangleObs}(undef, nonempty_triangles)
+  for (i, (triidx, idx)) in enumerate(tri2idx)
+    sort!(idx) # mitigate random access patterns as much as possible
+    Vₜ = [vertex[ijk][i] for i in 1:2, ijk in triidx]
+    Sₜ = S[:, idx]
+    Aₜ = barycentric(Sₜ, Vₜ)
+    triobs[i] = TriangleObs(triidx, idx, y[idx], X[idx, :], Sₜ, Aₜ, Vₜ)
+  end
+  return triobs
 end
 
 """

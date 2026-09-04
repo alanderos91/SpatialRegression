@@ -17,7 +17,7 @@ import Accessors
 import Base:
   iterate, length, eltype,
   firstindex, lastindex,
-  view
+  view, show
 
 import ChunkSplitters: is_chunkable
 
