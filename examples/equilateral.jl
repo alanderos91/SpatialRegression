@@ -109,14 +109,19 @@ end
 
 function get_meshes()
   boundary_points = default_equilateral_domain()
-  init_area = 0.5 *
-  norm(boundary_points[1] - 0.5*(boundary_points[2] + boundary_points[3])) *
-  norm(boundary_points[3] - boundary_points[2])
+  s = norm(boundary_points[1] - boundary_points[2])
+  init_area = sqrt(3)/4 * s*s
 
   Random.seed!(1903)
   Δ₀ = init_triangulation(boundary_points)
-  Δ₁ = equilateral_refinement(Δ₀, 0.01*init_area)
-  Δ₂ = equilateral_refinement(Δ₁, 0.001*init_area)
+  Δ₁ = AdaptiveRefinement.build_mesh(;
+    data = boundary_points,
+    inner = (; min_angle = 30.0, max_edge = 0.1*s)
+  )
+  Δ₂ = AdaptiveRefinement.build_mesh(;
+    data = boundary_points,
+    inner = (; min_angle = 30.0, max_edge = sqrt(1e-3)*s)
+  )
   
   return (Δ₀, Δ₁, Δ₂)
 end
