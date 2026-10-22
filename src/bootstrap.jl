@@ -89,12 +89,15 @@ end
 
 function bootstrap_ci(model, beta_b, scale_b, alpha, keep)
   # helper to create output
-  init_output(x) = (;
-    bias = zeros(size(x, 1), size(x, 2)),
-    lb   = zeros(size(x, 1), size(x, 2)),
-    ub   = zeros(size(x, 1), size(x, 2)),
+  init_output(x) = begin
+    N = size(x)[1:end-1]
+    (;
+    bias = zeros(N),
+    lb   = zeros(N),
+    ub   = zeros(N),
     data = keep ? x : nothing,
   )
+  end
   beta = init_output(beta_b)
   scale = init_output(scale_b)
   alpha_lb = 1 - alpha/2
@@ -109,8 +112,8 @@ function bootstrap_ci(model, beta_b, scale_b, alpha, keep)
 
       # use quantiles of residuals determine a confidence interval
       d = boot[:,j,:] .- theta_est
-      out.lb[:,j] .= theta_est .- mapslices(row -> quantile(row, alpha_lb), d, dims=2) |> vec
-      out.ub[:,j] .= theta_est .- mapslices(row -> quantile(row, alpha_ub), d, dims=2) |> vec
+      out.lb[:,j] .= theta_est .- out.bias[:,j] .- mapslices(row -> quantile(row, alpha_lb), d, dims=2) |> vec
+      out.ub[:,j] .= theta_est .- out.bias[:,j] .- mapslices(row -> quantile(row, alpha_ub), d, dims=2) |> vec
     end
   end
   return beta, scale

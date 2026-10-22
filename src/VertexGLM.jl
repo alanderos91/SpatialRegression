@@ -563,6 +563,7 @@ function predict!(yhat, X, S, m, tri, buffers; kind = :mean)
 end
 
 function _predict!_(yhat, X, S, m, tri, id2vertex, points, kind, buffers)
+  !(m.state.is_transformed) && transform_parameters!(m)
   @views for i in axes(X, 1)
     s = S[:, i]
     x = X[i, :]
@@ -574,6 +575,7 @@ function _predict!_(yhat, X, S, m, tri, id2vertex, points, kind, buffers)
       _search_mode_(h)
     end
   end
+  !(m.state.is_transformed) && transform_parameters!(m)
   return yhat
 end
 
