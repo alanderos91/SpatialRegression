@@ -65,10 +65,8 @@ function build_caches(triobs::Vector{TriangleObs}, vertex::Vector{V}, ::Abstract
     logf = init_cache_logf(triobs),
     # matrix of local average coefficients in MM algorithm, Γ
     gamma = init_cache_gamma(vertex, nvar),
-    # local average dispersion parameters in MM algorithm, avgϕ
-    avgphi = init_cache_avgphi(vertex),
     # ∇L, ∇²L, Δ
-    workspace = [(zeros(nvar), zeros(nvar, nvar), zeros(nvar)) for _ in 1:nchunks]
+    workspace = [(zeros(nvar), zeros(nvar, nvar), zeros(nvar)) for _ in 1:nchunks],
   )
 end
 
@@ -79,7 +77,6 @@ function update_caches!(model::SpatialVertexModel{<:VertexGLM}; nchunks::Int = T
       for v in workitr
         update_cache_logf!(model.caches.logf, v, model.triobs)
         update_cache_gamma!(model.caches.gamma, v, model.vertex)
-        needs_dispersion(v.family) && update_cache_avgphi!(model.caches.avgphi, v, model.vertex)
       end
     end
   end nchunks=nchunks
@@ -89,26 +86,7 @@ function update_caches_serial!(model::SpatialVertexModel{<:VertexGLM})
   for v in eachvertex(model)
     update_cache_logf!(model.caches.logf, v, model.triobs)
     update_cache_gamma!(model.caches.gamma, v, model.vertex)
-    needs_dispersion(v.family) && update_cache_avgphi!(model.caches.avgphi, v, model.vertex)
   end
-end
-#
-# FAMILY-SPECIFIC PARAMETER PENALTIES
-#
-eval_dispersion_penalty(::UnivariateDistribution, vertex) = zero(Float64)
-
-function eval_dispersion_penalty(::Normal, vertex)
-  penalty = zero(Float64)
-  for v in vertex
-    phi_j = v.dispersion
-    penalty += -log(phi_j) + 1//2*abs2(phi_j)
-    for (i, k) in enumerate(v.neighbors)
-      u = vertex[k]
-      phi_k = u.dispersion
-      penalty += 1//4 * v.weights[i] * abs2(phi_j - phi_k)
-    end
-  end
-  return 1//2*penalty
 end
 #
 # SURROGATE
@@ -139,40 +117,6 @@ function eval_loss_surrogate(beta::Vector, v::VertexGLM, triobs::Vector{Triangle
   end
   return -logl
 end
-
-function eval_loss_surrogate(phi::Real, v::VertexGLM, triobs::Vector{TriangleObs}, caches, xi)
-  cache = caches.logf
-  logl = zero(Float64)
-  j, family, link = v.index, v.family, v.link
-  itr = zip(eachtriobs(triobs, v), v.part)
-  for ((triidx, T), idxrange) in itr
-    t = get_triangle_vertices(T, j)
-    F = cache[triidx]
-    for (i, idx) in zip(eachobsindex(T), idxrange)
-      alpha = @get_triple T.A i
-      logf = @get_triple F i
-
-      # Evaluate log-likelihood term at ϕ
-      eta = v.eta[idx]
-      mu = meanfun(link, v.mu[idx])
-      logfⱼ = GLMUtilities.logpdf(T.y[i], mu, phi, eta, family, link)
-
-      # Evaluate terms dependent on the anchor point φₙ
-      zweight = stable_convex_weight(t, alpha, logf)
-      tmp = zweight < eps() ? zero(zweight) : zweight * logfⱼ + zweight * (log(alpha[t]) + log(inv(zweight)))
-      logl += tmp
-    end
-  end
-  return -logl
-end
-
-function eval_dispersion_surrogate(::Normal, phi_j, weights, avgphi)
-  penalty = -log(phi_j) + 1//2*abs2(phi_j)
-  @inbounds for (w_jk, avgphi_jk) in zip(weights, avgphi)
-    penalty += w_jk * abs2(phi_j - avgphi_jk)
-  end
-  return 1//2*penalty
-end
 #
 # UPDATES
 #
@@ -184,7 +128,11 @@ function initialize_coefficients!(v::VertexGLM, triobs)
     X[idxrange, :] .= T.X
     y[idxrange] .= T.y
   end
-  fitted = glm(X, y, v.family, v.link)
+  if v.family isa ALD
+    fitted = glm(X, y, Normal(), v.link)
+  else
+    fitted = glm(X, y, v.family, v.link)
+  end
   v.beta .= coef(fitted)
   return v
 end
@@ -243,20 +191,18 @@ function mm_update_coef!(penalty::AbstractPenalty, g::CoefficientSurrogate, v::V
   return v
 end
 
-function mm_update_disp!(::UnivariateDistribution, g::DispersionSurrogate, v::VertexGLM, triobs::Vector{TriangleObs}, workspace, caches)
-  error("MM updates not implemented for the $(v.family) case.")
+function local_deviance(::UnivariateDistribution, v::VertexGLM, triobs::Vector{TriangleObs}, workspace, caches)
+  error("local_deviance() not implemented for the $(v.family) case.")
 end
 
-function mm_update_disp!(::Normal, g::DispersionSurrogate, v::VertexGLM, triobs::Vector{TriangleObs}, workspace, caches)
+function local_deviance(::Normal, v::VertexGLM, triobs::Vector{TriangleObs}, workspace, caches)
   # Setup local variables to match notation
-  μ = v.mu
-  nu = g.opt.nu
-  avgphi = caches.avgphi[v.index]
+  mu = v.mu
 
   itr = zip(eachtriobs(triobs, v), v.part)
 
   # Fix β, update φ
-  rss = n_j = zero(eltype(v.beta))
+  n_j = rss = zero(eltype(v.beta))
   for ((triidx, T), idxrange) in itr
     y, A, t = T.y, T.A, get_triangle_vertices(T, v.index)
     F = caches.logf[triidx]
@@ -264,23 +210,12 @@ function mm_update_disp!(::Normal, g::DispersionSurrogate, v::VertexGLM, triobs:
       alpha = @get_triple A i
       logf = @get_triple F i
       zweight = stable_convex_weight(t, alpha, logf)
-      rss += zweight * deviance(v.family, y[i], μ[idx])
+      rss += zweight * deviance(v.family, y[i], mu[idx])
       n_j += zweight
     end
   end
 
-  a = 1//2*nu * (1 + 2*sum(v.weights))
-  b = nu * dot(avgphi, v.weights) - 1//2*rss
-  c = 1//2 * (n_j + nu)
-  phi1 = (b + sqrt(b*b + 4*a*c)) / (2*a)
-  phi2 = (b - sqrt(b*b + 4*a*c)) / (2*a)
-  if phi2 > 0
-    phi = g(phi1) < g(phi2) ? phi1 : phi2
-  else
-    phi = phi1
-  end
-  v = Accessors.@set v.dispersion = phi
-  return v
+  return n_j, rss
 end
 
 function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
@@ -290,7 +225,6 @@ function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
     backtrack::Int = 5,
     tol::Real = 1e-3,
     rho::Real = 1.0,
-    nu::Real = 1.0,
     nchunks::Int = Threads.nthreads(),
     verbose::Bool = false,
     kwargs...
@@ -301,13 +235,13 @@ function fitmodel(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
   model = create_model(VT, yfull, Xfull, Sfull, tri; nchunks, family, link, kwargs...)
   initialize!(model)
 
-  opt = (; rho, nu, xi = zero(rho), backtrack, verbose, nchunks)
+  opt = (; rho, backtrack, verbose, nchunks)
   _fitmodel_loop_(model, maxiter, tol, opt, true)
 end
 
 function _fitmodel_loop_(model::SpatialVertexModel{V}, maxiter, tol, opt, needs_transform) where V <: VertexGLM
   # unpacking + convenient definitions
-  rho, nu, verbose, nchunks = opt.rho, opt.nu, opt.verbose, opt.nchunks
+  rho, verbose, nchunks = opt.rho, opt.verbose, opt.nchunks
   family = get_family(model)
   f = model
 
@@ -315,7 +249,7 @@ function _fitmodel_loop_(model::SpatialVertexModel{V}, maxiter, tol, opt, needs_
   update_caches!(model; nchunks)
 
   # Main loop
-  nlogl = f(rho, nu; nchunks)
+  nlogl = f(rho; nchunks)
   nlogl_prev = zero(nlogl)
   iter = 0
 
@@ -334,17 +268,20 @@ function _fitmodel_loop_(model::SpatialVertexModel{V}, maxiter, tol, opt, needs_
 
     # Check convergence
     nlogl_prev = nlogl
-    nlogl = f(rho, nu; nchunks)
+    nlogl = f(rho; nchunks)
     verbose && @show iter, nlogl, nlogl_prev - nlogl
     @assert is_approx_decrease(nlogl, nlogl_prev, sqrt(eps()))
   end
 
+  # Report negative log-likelihood without penalty
+  nlogl = eval_loss(model.triobs, model.vertex, model.caches; nchunks)
+
   # Transform parameters as needed
   needs_transform && transform_parameters!(model)
 
-  # Make to reflect updated state in model
+  # Reflect updated state in model
   model = Accessors.@set model.state =
-    FittedState(true, needs_transform, rho, nu)
+    FittedState(true, needs_transform, rho)
 
   return iter, model, nlogl
 end
@@ -355,7 +292,6 @@ function cv(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
     train_prop::Real = 0.8,
     nfolds::Int = 5,
     grid_rho::AbstractVector=[1e-6, 1e-3, 1.0],
-    grid_nu::AbstractVector=[1.0],
     family::D = Normal(),
     link::L = IdentityLink(),
     maxiter::Int = 100,
@@ -392,7 +328,7 @@ function cv(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
   src = (yfull, Xfull, Sfull)
 
   # Setup before any CV or model fitting takes place
-  itr = Iterators.product(grid_rho, grid_nu)
+  itr = grid_rho
   nvals = length(itr)
   nvar = size(Xfull, 2)
   VT = infer_vertex_type(VertexGLM, family, link)
@@ -429,10 +365,10 @@ function cv(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
     initialize!(model)
 
     # Cross validate on penalty strength, rho
-    for (i, (rho, nu)) in enumerate(itr)
-      verbose && println("Fold $(k), rho = $(round(rho, sigdigits=4)), nu = $(round(nu, sigdigits=4))")
+    for (i, rho) in enumerate(itr)
+      verbose && println("Fold $(k), rho = $(round(rho, sigdigits=4))")
       # fit model with target hyperparameter + other fixed parameters
-      opt = (; rho, nu, xi = zero(rho), backtrack, verbose=false, nchunks)
+      opt = (; rho, backtrack, verbose=false, nchunks)
       fitstats = @timed _fitmodel_loop_(model, maxiter, tol, opt, false)
 
       # record model fit information
@@ -443,10 +379,8 @@ function cv(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
       # score model on different subsets
       for (idx, arr1, arr2) in zip(sub, result1, result2)
         y, X, S = materialize_data!(dst, src, idx)
-        yhat = view(y_tmp, 1:length(y))
-        predstats = @timed _predict!_(yhat, X, S, model, tri, helper.id2loc, tri_vertex_coords, :mean, buffers)
-        @. yhat = y - yhat
-        arr1[i,k] = mean(abs2, yhat) |> sqrt # MSE, replace with MISE?
+        predstats = @timed eval_negloglik(y, X, S, model, tri; nchunks)
+        arr1[i,k] = predstats.value
         arr2[i,k] = predstats.time
       end
     end
@@ -455,10 +389,8 @@ function cv(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
   # assemble results
   cv_scores = mean(score_val, dims=2) |> vec
   idx = argmin(cv_scores)
-  itr_size = (length(grid_rho), length(grid_nu))
-  car2lin = CartesianIndices(itr_size)[idx] |> Tuple
 
-  best_rho, best_nu = Iterators.drop(Iterators.take(itr, idx), idx-1) |> Iterators.only
+  best_rho = grid_rho[idx]
   results = (;
     # cross validation settings
     idx_cv, idx_tes, nfolds, train_prop,
@@ -469,12 +401,9 @@ function cv(::Type{VertexGLM}, yfull, Xfull, Sfull, tri;
     cv_scores,
     # optimal hyperparameter(s)
     grid_rho,
-    grid_nu,
     best_score = cv_scores,
     best_rho,
-    best_rho_index = first(car2lin),
-    best_nu,
-    best_nu_index = last(car2lin),
+    best_rho_index = idx,
   )
 
   return results
@@ -577,6 +506,43 @@ function _predict!_(yhat, X, S, m, tri, id2vertex, points, kind, buffers)
   end
   !(m.state.is_transformed) && transform_parameters!(m)
   return yhat
+end
+
+function pit_residuals(y, X, S, m::SpatialVertexModel, tri)
+  res = zeros(size(X, 1))
+  tmp = create_component(get_family(m), get_link(m), 0.0, 1.0)
+  T = typeof(tmp)
+  buffers = (Vector{T}(undef, 3), zeros(3))
+  pit_residuals!(res, y, X, S, m, tri, buffers)
+end
+
+function pit_residuals!(res, y, X, S, m, tri, buffers)
+  @inline function lse_update(m, s, t)
+    t == -Inf && return m, s  # zero-weight / underflowed term
+    t <= m ? (m, s + exp(t - m)) : (t, s * exp(m - t) + one(s))
+  end
+  indices = each_solid_vertex(tri) |> collect |> sort
+  id2vertex = Dict{Int,Int}(id => j for (j, id) in enumerate(indices))
+  points = get_points(tri)
+  phi = m.vertex[1].dispersion
+  !(m.state.is_transformed) && transform_parameters!(m)
+  @views for i in axes(X, 1)
+    s = S[:, i]
+    x = X[i, :]
+    h = _assemble_mixture_(x, s, m, tri, id2vertex, points, buffers)
+    mL, sL = -Inf, 0.0
+    mU, sU = -Inf, 0.0
+    for k in 1:3
+      logalpha = log(h.prior.p[k])
+      mL, sL = lse_update(mL, sL, logalpha + Distributions.logcdf(h.components[k], y[i]))
+      mU, sU = lse_update(mU, sU, logalpha + Distributions.logccdf(h.components[k], y[i]))
+    end
+    logL = mL + log(sL)
+    logU = mU + log(sU)
+    res[i] = logL < logU ? Distributions.invlogcdf(Normal(), logL) : Distributions.invlogccdf(Normal(), logU)
+  end
+  !(m.state.is_transformed) && transform_parameters!(m)
+  return res
 end
 
 function _search_mode_(h)

@@ -2,7 +2,6 @@ struct FittedState
   is_fitted::Bool
   is_transformed::Bool
   rho::Float64
-  nu::Float64
 end
 
 struct SpatialVertexModel{V <: AbstractVertexModel, P <: AbstractPenalty, C} <: AbstractSpatialModel
@@ -14,7 +13,7 @@ struct SpatialVertexModel{V <: AbstractVertexModel, P <: AbstractPenalty, C} <: 
 end
 
 function SpatialVertexModel(triobs, vertex, penalty, caches)
-  state = FittedState(false, false, 0.0, 0.0)
+  state = FittedState(false, false, 0.0)
   return SpatialVertexModel(triobs, vertex, penalty, caches, state)
 end
 
@@ -52,7 +51,7 @@ function create_vertex_set(
     # initialize weights
     weights = ones(nneighbors)
     for (k, other) in enumerate(DelaunayTriangulation.iterated_neighbourhood(tri, id, 1))
-      weights[k] = 1 / DelaunayTriangulation.dist(get_point(tri, id), get_point(tri, other))
+      weights[k] = DelaunayTriangulation.dist(get_point(tri, id), get_point(tri, other))
       wmin = min(wmin, weights[k])
       wmax = max(wmax, weights[k])
     end
@@ -63,7 +62,7 @@ function create_vertex_set(
   end
   
   for v in vertex
-    v.weights .= v.weights / wmax
+    v.weights .= v.weights
   end
 
   return vertex
@@ -143,36 +142,13 @@ function update_cache_gamma!(cache, v::V, vertex::Vector{V}) where V <: Abstract
     end
   end
 end
-
-function init_cache_avgphi(vertex)
-  update_phi = needs_dispersion(first(vertex).family)
-  if update_phi
-    avgphi = Vector{Vector{Float64}}(undef, length(vertex))
-    for (j, v) in zip(eachindex(avgphi), vertex)
-      avgphi[j] = similar(v.weights)
-    end
-  else
-    avgphi = Vector{Vector{Float64}}(undef, 0)
-  end
-  return avgphi
-end
-
-function update_cache_avgphi!(cache, v::V, vertex::Vector{V}) where V <: AbstractVertexModel
-  phi_j = v.dispersion
-  avgphi = cache[v.index]
-  for (i, k) in zip(eachindex(avgphi), v.neighbors)
-    phi_k = vertex[k].dispersion
-    avgphi[i] = 1//2 * (phi_j + phi_k)
-  end
-end
 #
 # LOSS
 #
-function (f::SpatialVertexModel)(rho, nu; kwargs...)
+function (f::SpatialVertexModel)(rho; kwargs...)
   loss = eval_loss(f.triobs, f.vertex, f.caches; kwargs...)
   penalty1 = eval_penalty(f.penalty, f.vertex)
-  penalty2 = needs_dispersion(first(f.vertex).family) ? eval_dispersion_penalty(first(f.vertex).family, f.vertex) : zero(penalty1)
-  return loss + rho*penalty1 + nu*penalty2
+  return loss + rho*penalty1
 end
 
 function eval_loss(triobs::Vector{TriangleObs}, ::Vector{<:AbstractVertexModel}, caches; nchunks::Int = Threads.nthreads(), kwargs...)
@@ -196,6 +172,54 @@ function eval_loss(triobs::Vector{TriangleObs}, ::Vector{<:AbstractVertexModel},
   end
   return -logl
 end
+
+function eval_negloglik(y, X, S, model, mesh;
+  nchunks::Int = Threads.nthreads(),
+  )
+  #
+  helper = create_triobs_helper(mesh)
+  vertex = helper.loc
+  id2loc = helper.id2loc
+  logl = @tasks for idxset in chunks(eachindex(y); n = nchunks)
+    @set begin
+      chunking = false
+      reducer = +
+      outputtype = Float64
+    end
+    local c = zero(Float64)
+    local alpha = zeros(Float64, 3)
+    local logf = zeros(Float64, 3)
+    local V = zeros(Float64, 2, 3)
+    @views for i in idxset
+      s = S[:, i]
+      x = X[i, :]
+      # Assemble matrix V containing vertices of enclosing triangle
+      j, k, l = find_triangle(mesh, s, concavity_protection = true)
+      j, k, l = sort((id2loc[j], id2loc[k], id2loc[l]))
+      for (col, t) in enumerate((j, k, l)), row in 1:2
+        V[row, col] = vertex[t][row]
+      end
+      # Solve for barycentric coordinates
+      barycentric!(alpha, s, V)
+      # Evaluate log-likelihood terms in triangle
+      for (m, t) in enumerate((j, k, l))
+        v = model.vertex[t]
+        beta, family, link = v.beta, v.family, v.link
+        if needs_dispersion(family)
+          phi = model.state.is_transformed ? 1 / v.dispersion : v.dispersion
+        else
+          phi = one(v.dispersion)
+        end
+        eta = dot(x, beta)
+        mu = meanfun(link, eta)
+        logf[m] = GLMUtilities.logpdf(y[i], mu, phi, eta, family, link)
+      end
+      c += weighted_logsumexp(alpha, logf)
+    end
+    return c
+  end
+  return -logl
+end
 #
 # SURROGATE
 #
@@ -206,31 +230,14 @@ struct CoefficientSurrogate{V <: AbstractVertexModel, P <: AbstractPenalty, C, N
 end
 
 function (g::CoefficientSurrogate)(beta)
+  global ξ
   model = g.model
   caches = model.caches
   j = g.index
   v = model.vertex[j]
-  loss = eval_loss_surrogate(beta, v, model.triobs, caches, g.opt.xi)
+  loss = eval_loss_surrogate(beta, v, model.triobs, caches, ξ[])
   penalty1 = eval_penalty_surrogate(model.penalty, beta, v.weights, caches.gamma[j], v.beta)
-  penalty2 = needs_dispersion(v.family) ? eval_dispersion_surrogate(v.family, v.dispersion, v.weights, caches.avgphi[j]) : zero(penalty1)
-  return loss + g.opt.rho*penalty1 + g.opt.nu*penalty2
-end
-
-struct DispersionSurrogate{V <: AbstractVertexModel, P <: AbstractPenalty, C, NT}
-  index::Int
-  model::SpatialVertexModel{V,P,C}
-  opt::NT
-end
-
-function (g::DispersionSurrogate)(phi)
-  model = g.model
-  caches = model.caches
-  j = g.index
-  v = model.vertex[j]
-  loss = eval_loss_surrogate(phi, v, model.triobs, caches, g.opt.xi)
-  penalty1 = eval_penalty_surrogate(model.penalty, v.beta, v.weights, caches.gamma[j], v.beta)
-  penalty2 = needs_dispersion(v.family) ? eval_dispersion_surrogate(v.family, phi, v.weights, caches.avgphi[j]) : zero(penalty1)
-  return loss + g.opt.rho*penalty1 + g.opt.nu*penalty2
+  return loss + g.opt.rho*penalty1
 end
 #
 # ESTIMATION
@@ -265,18 +272,32 @@ function update_coefficients!(model, opt, nchunks)
 end
 
 function update_dispersion!(model, opt, nchunks)
-  workspace = ChannelLike(model.caches.workspace)
+  add_tuple(x, y) = x .+ y
+  workspace = model.caches.workspace
   workitr = ChannelLike(eachvertex(model))
-  @safe_blas begin
-    tforeach(1:nchunks; chunking = false) do _
-      map(workspace) do wrk
-        for v in workitr
-          local g = DispersionSurrogate(v.index, model, opt)
-          model.vertex[v.index] = mm_update_disp!(v.family, g, v, model.triobs, wrk, model.caches)
-        end
-      end
+  a, b = @tasks for i in 1:nchunks
+    @set begin
+      chunking = false
+      reducer = add_tuple
+      init = (0.0, 0.0)
+      outputtype = Tuple{Float64,Float64}
     end
-  end nchunks=nchunks
+    local wrk = workspace[i]
+    local a = 0.0
+    local b = 0.0
+    for v in workitr
+      aj, bj = local_deviance(v.family, v, model.triobs, wrk, model.caches)
+      a += aj
+      b += bj
+    end
+    (a, b) # return value for reduction
+  end
+
+  phi = a / b
+
+  for v in eachvertex(model)
+    model.vertex[v.index] = (Accessors.@set v.dispersion = phi)
+  end
 
   return nothing
 end

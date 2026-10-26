@@ -19,18 +19,20 @@ function create_resampler(model, X, S, tri)
 end
 
 function resample(rh::ResampleHelper)
-  return rand.(rh.mixtures)
+  y = zeros(length(rh.mixtures))
+  return map!(rand, y, rh.mixtures)
 end
 #
 # Assumes (y, X, S) are the data used to fit the model
 #
 function bootstrap(model::SpatialVertexModel{V}, y, X, S, tri, options;
     cv_options::NamedTuple = (;),
-    refit::Bool = true,
+    refit::Bool = false,
     replicates::Int = 100,
     alpha::Real = 0.05,
+    undersmooth::Real = 0.1,
     keep::Bool = false,
-    progress = false,
+    progress::Bool = false,
   ) where V <: VertexGLM
   #
   refit && isempty(cv_options) &&
@@ -41,18 +43,16 @@ function bootstrap(model::SpatialVertexModel{V}, y, X, S, tri, options;
   beta_b = zeros(size(X, 2), nvertices, replicates)
   scale_b = zeros(1, nvertices, replicates)
   rho_ = refit ? zeros(replicates) : [model.state.rho]
-  nu_ = refit ? zeros(replicates) : [model.state.nu]
 
   # use parametric bootstrap to generate bootstrap data
   for b in 1:replicates
     y_b = resample(helper)
     tbeg = progress ? time() : 0.0
-    r_b = bootstrap_replicate(model, y_b, X, S, tri, cv_options, options, refit)
+    r_b = bootstrap_replicate(model, y_b, X, S, tri, cv_options, options, refit, undersmooth)
     tend = progress ? time() : 0.0
     progress && println("Replicate $(lpad(b, ndigits(replicates))) / $(replicates): $(rpad(round(tend - tbeg, sigdigits = 4), 5)) seconds")
     if refit
       rho_[b] = r_b.model.state.rho
-      nu_[b] = r_b.model.state.rho
     end
     for (j, v_b) in enumerate(eachvertex(r_b.model))
       @. beta_b[:,j,b] = v_b.beta
@@ -62,12 +62,12 @@ function bootstrap(model::SpatialVertexModel{V}, y, X, S, tri, options;
   # compute ci from the bootstrap data
   beta, scale = bootstrap_ci(model, beta_b, scale_b, alpha, keep)
   results = (;
-    model, replicates, refit, alpha, beta, scale, rho = rho_, nu = nu_
+    model, replicates, refit, alpha, beta, scale, rho = rho_,
   )
   return results
 end
 
-function bootstrap_replicate(model, y_b, X, S, tri, cv_options, options, refit)
+function bootstrap_replicate(model, y_b, X, S, tri, cv_options, options, refit, undersmooth)
   # get information from model object
   family, link, penalty = get_family(model), get_link(model), model.penalty
   if refit
@@ -75,15 +75,21 @@ function bootstrap_replicate(model, y_b, X, S, tri, cv_options, options, refit)
     results = cv(VertexGLM, y_b, X, S, tri;
       cv_options..., options..., family, link, penalty,
     )
-    rho_b, nu_b = results.best_rho, results.best_nu
+    rho_b = results.best_rho
   else
     # conditional bootstrap; here be dragons
-    rho_b, nu_b = model.state.rho, model.state.nu
+    rho_b = undersmooth * model.state.rho
   end
   # fit the model
-  niter, model_b, nlogl = fitmodel(VertexGLM, y_b, X, S, tri;
-    options..., family, link, penalty, rho = rho_b, nu = nu_b,
-  )
+  if family isa ALD
+    niter, model_b, nlogl = fitqreg(VertexGLM, y_b, X, S, tri;
+      options..., family, link, penalty, rho = rho_b,
+    )
+  else
+    niter, model_b, nlogl = fitmodel(VertexGLM, y_b, X, S, tri;
+      options..., family, link, penalty, rho = rho_b,
+    )
+  end
   return (; model = model_b, niter, nlogl,)
 end
 

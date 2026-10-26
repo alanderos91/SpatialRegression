@@ -21,6 +21,10 @@ import Base:
 
 import ChunkSplitters: is_chunkable
 
+# Global Moreau envelope parameter...
+const ξ = Ref(1.0)
+const ξmin = Ref(1.0)
+
 # Isolate Distributions + GLM code in separate module.
 # Any required imports are handled in the module and available here.
 include("GLMUtilities.jl")
