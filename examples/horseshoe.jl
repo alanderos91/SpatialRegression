@@ -1,5 +1,5 @@
 import Pkg
-Pkg.activate(".")
+# Pkg.activate(".")
 
 module Horseshoe
 # Constants for common arguments

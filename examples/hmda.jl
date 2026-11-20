@@ -18,6 +18,7 @@ using Tables, TableOperations
 using CategoricalArrays
 using LibGEOS, Shapefile
 import GeometryOps as GO
+import GeoInterface as GI
 import ArchGDAL as AD
 
 using LinearAlgebra, Random, Statistics, StatsBase, StatsModels, Distributions, GLM
@@ -240,18 +241,21 @@ function load_conus_triangulation(filepath)
   boundary_unique = unique(boundary_points)
   lookup = Dict(key => i for (i, key) in enumerate(boundary_unique))
   curve = map(key -> lookup[key], boundary_points)
-  tri = triangulate(boundary_unique, boundary_nodes = reverse(curve))
-  init_area = get_area(tri)
-  DelaunayTriangulation.refine!(tri, min_angle = 30.0, max_area = 0.001 * init_area)
-  DelaunayTriangulation.add_ghost_triangles!(tri)
-  return tri
+  # init_mesh = triangulate(boundary_unique, boundary_nodes = reverse(curve))
+  mesh = AdaptiveRefinement.build_mesh(;
+    data = boundary_unique,
+    boundary_nodes = reverse(curve),
+    inner = (; min_angle = 30.0, min_area = 0.2)
+  )
+  
+  return mesh
 end
 
 function get_meshes()
   return (
-    load_conus_triangulation(joinpath("USBoundary_tol=0.5.csv")),
+    # load_conus_triangulation(joinpath("USBoundary_tol=0.5.csv")),
     load_conus_triangulation(joinpath("USBoundary_tol=0.1.csv")),
-    load_conus_triangulation(joinpath("USBoundary_tol=0.01.csv"))
+    # load_conus_triangulation(joinpath("USBoundary_tol=0.01.csv"))
   )
 end
 

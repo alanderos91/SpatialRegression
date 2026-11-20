@@ -1,6 +1,3 @@
-import Pkg
-Pkg.activate(".")
-
 """
 Benchmarks over an equilateral spatial domain.
 
@@ -20,6 +17,7 @@ using CairoMakie
 using DataFrames, PrettyTables, CategoricalArrays
 using JLD2
 using SpatialRegression: L2Squared, L1Approx, AsymmetricLaplace, ALD
+using SparseArrays
 
 LABEL_FONTSIZE = 24
 SCALE_FACTOR = 4
@@ -31,7 +29,41 @@ function equilateral_refinement(Δ, max_area)
   return Δnew
 end
 
-function simulate_data(n, p, Δ, family, link)
+function forward_difference_matrix(n)
+  I_idx = 1:(n-1)
+  J_idx = 1:(n-1)
+  V_main = fill(-1.0, n - 1)
+
+  # Construct sparse matrix of size (n-1) x n
+  D = sparse(1:(n-1), 1:(n-1), -1.0, n - 1, n)
+  D .+= sparse(1:(n-1), 2:n, 1.0, n - 1, n)
+  return D
+end
+
+function simulate_data(n, p, Δ, family, link; lambda = 1.0, phi = 1.0)
+  # Extract graphical structure
+  indices = each_solid_vertex(Δ) |> collect |> sort
+  vertices = [[get_point(Δ, v)...] for v in indices]
+  points = get_points(Δ)
+  id2vertex = Dict{Int,Int}(id => j for (j, id) in enumerate(indices))
+  D = forward_difference_matrix(length(vertices))
+  W = Symmetric(zeros(length(vertices), length(vertices)))
+  wmin, wmax = Inf, -Inf
+  
+  for (j, id) in enumerate(indices)
+    for other in DelaunayTriangulation.iterated_neighbourhood(Δ, id, 1)
+      k = id2vertex[other]
+      w = 1 / DelaunayTriangulation.dist(get_point(Δ, id), get_point(Δ, other))
+      w = sqrt(w)
+      W.data[j,k] = w
+      wmin = min(wmin, w)
+      wmax = max(wmax, w)
+    end
+  end
+  W = W #./ wmax
+  Q = Symmetric(W * D' * D * W + 1e-2*I)
+  Σb = inv(lambda * Q)
+
   # Sample from the standard 2-simplex, then convert to Cartesian coords
   A = rand(Dirichlet(ones(3)), n)
   V = [0 1; -sqrt(3)/2 -1/2; sqrt(3)/2 -1/2] |> Transpose |> Matrix{Float64}
@@ -39,27 +71,14 @@ function simulate_data(n, p, Δ, family, link)
 
   # Simulate responses at each location according to true model
   Bfun(x, y) = -10*sin(7*π*(x + 0.15)) + 10*sin(7*π*y)
-  indices = each_solid_vertex(Δ) |> collect |> sort
-  vertices = [[get_point(Δ, v)...] for v in indices]
-  points = get_points(Δ)
-  id2vertex = Dict{Int,Int}(id => j for (j, id) in enumerate(indices))
   X = 1/p*rand(Uniform(-1, 1), n, p)
   X[:, 1] .= 1
-  B = [1//8 * Bfun(s[1], s[2]) for j in 1:p, s in vertices]
-  if family isa Poisson
-    # B[1, :] .= rand(Uniform(3, 4), size(B, 2))
-    # B[2:end, :] .*= 1/4
-    B .+= 3
-  else
-    # B[1, :] .= rand(Uniform(-3, 3), size(B, 2))
-  end
-  if family isa Normal
-    Φ = rand(1*Beta(2.0, 5.0), length(vertices))
-  elseif family isa AsymmetricLaplace
-    Φ = rand(1*Beta(2.0, 10.0), length(vertices))
-  else
-    Φ = ones(length(vertices))
-  end
+  B = [1//8 * Bfun(s[1], s[2]) for j in 1:p, s in vertices] .+ reshape(
+    rand(MvNormal(zeros(length(vertices)), Σb), p),
+    p,
+    length(vertices)
+  )
+
   y = zeros(n)
   H = MixtureModel[]
   for i in 1:n
@@ -69,19 +88,18 @@ function simulate_data(n, p, Δ, family, link)
     j, k, l = id2vertex[j], id2vertex[k], id2vertex[l]
     b1, b2, b3 = @views begin B[:, j], B[:, k], B[:, l] end
     a1, a2, a3 = SpatialRegression.barycentric(s, [v1 v2 v3])
-    φ1, φ2, φ3 = Φ[j], Φ[k], Φ[l]
     mixture = @views MixtureModel(
       [
-        SpatialRegression.create_component(family, link, dot(X[i, :], b1), φ1),
-        SpatialRegression.create_component(family, link, dot(X[i, :], b2), φ2),
-        SpatialRegression.create_component(family, link, dot(X[i, :], b3), φ3),
+        SpatialRegression.create_component(family, link, dot(X[i, :], b1), phi),
+        SpatialRegression.create_component(family, link, dot(X[i, :], b2), phi),
+        SpatialRegression.create_component(family, link, dot(X[i, :], b3), phi),
       ],
       [a1, a2, a3]
     )
     y[i] = rand(mixture)
     push!(H, mixture)
   end
-  return y, X, S, B, Φ, H
+  return y, X, S, B, phi, H
 end
 #
 # TRIANGULATIONS
@@ -148,52 +166,82 @@ end
 
 function plot_fitted(datasets; markersize = 4.0, kwargs...)
   global MODEL_DIR, LABEL_FONTSIZE, SCALE_FACTOR
-  sort!(datasets, by=extract_mesh_triangles)
-  model_basenames = @. basename(datasets) |> splitext |> first
-  model_filenames = mapreduce(fn -> filter(contains(fn), readdir(MODEL_DIR)), union, model_basenames)
+  @assert length(datasets) == 1
+  dataset_name = datasets |> first
+
+  _models, mesh_dims = String[], String[]
+  dataset_name = basename(dataset_name) |> splitext |> first
+  fn = first(split(dataset_name, "_mesh-"))
+  for model_file in filter(contains(fn), readdir(MODEL_DIR))
+    push!(_models, model_file)
+    push!(mesh_dims, extract_mesh_id(model_file))
+  end
+
+  unique!(mesh_dims)
+  sort!(_models, by = extract_penalty)
+  sort!(_models, by = extract_mesh_triangles)
 
   local W = 400
   local H = 400
-  local NCOL = length(model_basenames)
-  local NROW = div(length(model_filenames), NCOL)
+  local NCOL = length(mesh_dims)
+  local NROW = 1 + div(length(_models), NCOL)
+
+  models = reshape(_models, NROW - 1, NCOL)
 
   # Initialize figure with column labels
   fig = Figure(size = (W * NCOL, H * NROW))
   Label(fig[2,1], "Observed", font = :bold, fontsize = LABEL_FONTSIZE, rotation = pi/2, tellheight = false)
 
-  cmap = Reverse(:lightrainbow)
+  cmap = :lightrainbow
   cr = Observable((0.0, 1.0))
-  for (j, dataset_name) in enumerate(model_basenames)
-    # Retrieve data
-    y, X, S, mesh = load_data(dataset_name*".jld2", "y", "X", "S", "mesh")
 
-    # Update minimum and maximum values for color scale
-    ymin, ymax = cr[]
-    cr[] = (min(minimum(y), ymin), max(maximum(y), ymax))
+  # Retrieve data
+  y, X, S = load_data(dataset_name*".jld2", "y", "X", "S")
 
-    # Add a row label with triangulation characteristics
-    Label(fig[1,1+j], get_tri_title(mesh), font = :bold, fontsize = LABEL_FONTSIZE, tellwidth = false)
+  # Update minimum and maximum values for color scale
+  ymin, ymax = cr[]
+  cr[] = (min(minimum(y), ymin), max(maximum(y), ymax))
 
+  # Predictions
+  for k in axes(models, 2)
     # Add a panel for observed data
-    ax = Axis(fig[2,1+j])
-    scatter!(ax, S[1,:], S[2,:]; color = y, colormap = cmap, colorrange = cr, markersize, rasterize = SCALE_FACTOR, kwargs...)
+    ax = Axis(fig[2,1+k]; aspect = 1)
+    scatter!(ax, S[1,:], S[2,:];
+      color = y,
+      colormap = cmap,
+      colorrange = cr,
+      markersize,
+      rasterize = SCALE_FACTOR,
+      kwargs...
+    )
 
-    # Predictions
-    matching_models = filter(contains(dataset_name), model_filenames)
-    sort!(matching_models, by=extract_penalty)
-    for (k, model_name) in enumerate(matching_models)
-      model, metadata = load_model(model_name, "model", "metadata")
-      if j == 1
-        Label(fig[2+k,1], metadata.penalty_name, font = :bold, fontsize = LABEL_FONTSIZE, rotation = pi/2, tellheight = false)
+    for j in axes(models, 1)
+      model_name = models[j,k]
+      model, mesh, metadata = load_model(model_name, "model", "mesh", "metadata")
+
+      # Add a row label with triangulation characteristics
+      Label(fig[1,1+k], get_tri_title(mesh), font = :bold, fontsize = LABEL_FONTSIZE, tellwidth = false)
+
+      if k == 1
+        Label(fig[2+j,1], metadata.penalty_name, font = :bold, fontsize = LABEL_FONTSIZE, rotation = pi/2, tellheight = false)
       end
+
       yhat = SpatialRegression.predict(X, S, model, mesh; kind = :mean)
       ymin, ymax = cr[]
       cr[] = (min(minimum(yhat), ymin), max(maximum(yhat), ymax))
-      ax = Axis(fig[2+k,1+j])
-      scatter!(ax, S[1,:], S[2,:]; color = yhat, colormap = cmap, colorrange = cr, markersize, rasterize = SCALE_FACTOR, kwargs...)
+      ax = Axis(fig[2+j,1+k]; aspect = 1)
+      scatter!(ax, S[1,:], S[2,:];
+        color = yhat,
+        colormap = cmap,
+        colorrange = cr,
+        markersize,
+        rasterize = SCALE_FACTOR,
+        kwargs...
+      )
     end
   end
-  Colorbar(fig[2:2+NROW, 2+NCOL], colormap = cmap, colorrange = cr, vertical = true)
+
+  Colorbar(fig[2:(1+NROW), 2+NCOL], colormap = cmap, colorrange = cr, vertical = true)
   return fig
 end
 #
@@ -208,7 +256,6 @@ function run_benchmark(scenario_name, Δ, y, X, S, family, link, penalty, opts)
     family    = family,
     link      = link,
     penalty   = penalty,
-    nu        = opts.nu,
     rho       = opts.rho,
     tol       = opts.tol,
     backtrack = opts.backtrack,
@@ -221,7 +268,6 @@ function run_benchmark(scenario_name, Δ, y, X, S, family, link, penalty, opts)
     family    = family,
     link      = link,
     penalty   = penalty,
-    nu        = opts.nu,
     rho       = opts.rho,
     tol       = opts.tol,
     backtrack = opts.backtrack,
@@ -277,14 +323,14 @@ function filename_data(name, (n, p), mesh_id, seed)
   "$(name)_dims-$(n)-$(p)_$(mesh_id)_seed-$(seed).jld2"
 end
 
-function retrieve_data(scenario, Δ, seed)
+function retrieve_data(scenario, seed)
   filename = filename_data(
-    scenario.name, scenario.dims, mesh_identifier(Δ), seed
+    scenario.name, scenario.dims, mesh_identifier(scenario.mesh), seed
   )
   if !isfile(joinpath(DATA_DIR, filename))
     let
       Random.seed!(seed)
-      y, X, S, B, Φ, _ = scenario.data(Δ)
+      y, X, S, B, Φ, _ = scenario.data(scenario.mesh)
       save_data(
         filename,
         "y",  y,
@@ -292,20 +338,21 @@ function retrieve_data(scenario, Δ, seed)
         "S",  S,
         "B",  B,
         "Φ",  Φ,
-        "mesh", Δ,
+        "mesh", scenario.mesh,
       )
     end
   end
   return load_data(filename, "y", "X", "S")
 end
 
-function save_model(model, metadata)
+function save_model(model, mesh, metadata)
   global MODEL_DIR
   filename = filename_model(
     metadata.scenario, metadata.dims, metadata.mesh_id, metadata.seed, metadata.penalty_name
   )
   JLD2.save(joinpath(MODEL_DIR, filename),
     "model",    model,
+    "mesh",     mesh,
     "metadata", metadata,
   )
 end
@@ -327,6 +374,11 @@ end
 function extract_family(filename)
   parts = extract_parts(filename)
   return split(parts[1], '-')[3]
+end
+
+function extract_mesh_id(filename)
+  parts = extract_parts(filename)
+  return parts[findfirst(contains("mesh"), parts)]
 end
 
 function extract_mesh_triangles(filename)
@@ -358,16 +410,25 @@ function table_summary()
   data_filenames = filter(contains("Equilateral-Uniform"), readdir(DATA_DIR))
   map(data_filenames) do fn
     file_basename = basename(fn) |> splitext |> first
+    file_basename = split(file_basename, "_mesh") |> first
     family = extract_family(fn)
-    (y, X, S, B, Φ, mesh) = load_data(fn, "y", "X", "S", "B", "Φ", "mesh")
-    stats = statistics(mesh)
+    (y, X, S, B, Φ, MESH) = load_data(fn, "y", "X", "S", "B", "Φ", "mesh")
     matching_models = filter(contains(file_basename), readdir(MODEL_DIR))
     map(matching_models) do modelfile
-      model, metadata = load_model(modelfile, "model", "metadata")
-      
+      model, mesh, metadata = load_model(modelfile, "model", "mesh", "metadata")
+      stats = statistics(mesh)
+      display(modelfile)
+      indices  = each_solid_vertex(MESH) |> collect |> sort
+      vertices = [[get_point(MESH, v)...] for v in indices]
+      id2vertex = Dict{Int,Int}(id => j for (j, id) in enumerate(indices))
+
       yhat = SpatialRegression.predict(X, S, model, mesh; kind = :mean)
-      Bhat = hcat([v.beta for v in model.vertex]...)
-      Φhat = [v.dispersion for v in model.vertex]
+      Bhat = hcat([SpatialRegression.coefficients(v, model, mesh) for v in vertices]...)
+      Φhat = first(model.vertex).dispersion
+
+      @assert length(y) == length(yhat) "Observed: $(length(yhat)); Expected: $(length(y))"
+      @assert length(B) == length(Bhat) "Observed: $(length(Bhat)); Expected: $(length(B))"
+      @assert length(Φ) == length(Φhat)
       
       rmse1 = mean(abs2, y - yhat) |> sqrt
       rmse2 = mean(abs2, B - Bhat) |> sqrt
@@ -424,8 +485,7 @@ pretty_table(
 
     formatters = [
         fmt__printf("%.2f", [4]),
-        fmt__printf("%.3f", [5]),
-        fmt__latex_sn(2, [6, 7]),
+        fmt__printf("%.3f", [5, 6, 7]),
     ],
 
     alignment = [
@@ -442,14 +502,16 @@ function run_balanced(; bench=true, plot=true)
   instantiate_directories()
 
   n, p  = 4*10^4, 1
-  rho   = 1.0
-  nu    = 1.0
+  rho   = 1e2
+  phi   = 1e-1
   tol   = 1e-6
-  seed  = 1903
+  seed  = 1234
   maxiter   = 2*10^3
   nthreads  = 4
   backtrack = 100
   penalties = (L2Squared(), L1Approx(sqrt(1e-16)))
+  meshes = get_meshes()
+  MESH = meshes[end]
 
   scenarios = [
     #
@@ -458,9 +520,10 @@ function run_balanced(; bench=true, plot=true)
     (;
       name    = "Equilateral-Uniform-Normal",
       dims    = (n, p),
-      data    = Δ -> simulate_data(n, p, Δ, Normal(), IdentityLink()),
+      data    = Δ -> simulate_data(n, p, Δ, Normal(), IdentityLink(); lambda = rho, phi = phi),
       family  = Normal(),
       link    = IdentityLink(),
+      mesh    = MESH,
     ),
     #
     # SCENARIO 2: Uniform over domain, Binomial response
@@ -468,9 +531,10 @@ function run_balanced(; bench=true, plot=true)
     (;
       name    = "Equilateral-Uniform-Binomial",
       dims    = (n, p),
-      data    = Δ -> simulate_data(n, p, Δ, Binomial(), LogitLink()),
+      data    = Δ -> simulate_data(n, p, Δ, Binomial(), LogitLink(); lambda = rho, phi = 1.0),
       family  = Binomial(),
       link    = LogitLink(),
+      mesh    = MESH,
     ),
     #
     # SCENARIO 3: Uniform over domain, Poisson response
@@ -478,26 +542,26 @@ function run_balanced(; bench=true, plot=true)
     (;
       name    = "Equilateral-Uniform-Poisson",
       dims    = (n, p),
-      data    = Δ -> simulate_data(n, p, Δ, Poisson(), LogLink()),
+      data    = Δ -> simulate_data(n, p, Δ, Poisson(), LogLink(); lambda = rho, phi = 1.0),
       family  = Poisson(),
       link    = LogLink(),
+      mesh    = MESH,
     ),
   ];
 
-  meshes = get_meshes()
-  opts = (; rho, nu, tol, maxiter, nthreads, backtrack)
+  opts = (; rho, tol, maxiter, nthreads, backtrack)
 
   bench && for scenario in scenarios, Δ in meshes
     stats = statistics(Δ)
     vertices = stats.num_solid_vertices
     triangles = stats.num_solid_triangles
-    y, X, S = retrieve_data(scenario, Δ, seed)
+    y, X, S = retrieve_data(scenario, seed)
     for penalty in penalties
       @info "Running $(scenario.name)..." penalty = get_penalty_name(penalty) vertices triangles
       model, _metadata = run_benchmark(scenario.name, Δ, y, X, S, scenario.family, scenario.link, penalty, opts)
       metadata = (; _metadata..., seed)
       @info "Saving model..."
-      save_model(model, metadata)
+      save_model(model, Δ, metadata)
     end
   end
 
@@ -517,4 +581,7 @@ end # module
 if !isinteractive()
   Equilateral.plot_meshes()
   Equilateral.run_balanced()
+else
+  import Pkg
+  Pkg.activate(".")
 end

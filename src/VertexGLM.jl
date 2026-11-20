@@ -434,6 +434,42 @@ _get_view_(dst::Vector, n, ::ObsDim{1}) = view(dst, 1:n)
 _get_view_(dst::Matrix, n, ::ObsDim{1}) = view(dst, 1:n, :)
 _get_view_(dst::Matrix, n, ::ObsDim{2}) = view(dst, :, 1:n)
 #
+# COEFFICIENTS
+#
+function coefficients(s, m::SpatialVertexModel, mesh)
+  indices = each_solid_vertex(mesh) |> collect |> sort
+  id2vertex = Dict{Int,Int}(id => j for (j, id) in enumerate(indices))
+  points = get_points(mesh)
+
+  j = k = l = -1
+  attempts = 0
+  MAX_ATTEMPTS = 20
+  while any(<(1), (j, k, l)) && attempts < MAX_ATTEMPTS
+    attempts += 1
+    j, k, l = find_triangle(mesh, s) |> sort
+    if DelaunayTriangulation.is_ghost_triangle((j, k, l))
+      l, k, _ = DelaunayTriangulation.sort_triangle((j, k, l))
+      j = DelaunayTriangulation.get_adjacent(mesh, k, l)
+    end
+    if DelaunayTriangulation.is_ghost_triangle((j, k, l))
+      j = DelaunayTriangulation.get_adjacent(mesh, l, k)
+    end
+  end
+  if attempts == MAX_ATTEMPTS
+    @show j, k, l
+  end
+  j, k, l = sort((j, k, l))
+  p, q, r = points[j], points[k], points[l]
+  j, k, l = id2vertex[j], id2vertex[k], id2vertex[l]
+  vertex = (m.vertex[j], m.vertex[k], m.vertex[l])
+  alpha = barycentric(s, [p[1] q[1] r[1]; p[2] q[2] r[2]])
+  clamp!(alpha, 1e-12, 1.0)
+  alpha .= alpha / sum(alpha)
+  return alpha[1] * vertex[1].beta +
+    alpha[2] * vertex[2].beta +
+    alpha[3] * vertex[3].beta
+end
+#
 # PREDICTION
 #
 function assemble_mixture(x, s, m, tri, id2vertex, points)

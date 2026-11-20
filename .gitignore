@@ -7,3 +7,4 @@ examples/figures/*.*
 examples/tables/*.*
 examples/vignettes/*.*
 dev/
+examples/coverage/*
