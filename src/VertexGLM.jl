@@ -447,16 +447,19 @@ function coefficients(s, m::SpatialVertexModel, mesh)
   while any(<(1), (j, k, l)) && attempts < MAX_ATTEMPTS
     attempts += 1
     j, k, l = find_triangle(mesh, s) |> sort
+    # Try to detect the solid edges again; j may fail as < 0
     if DelaunayTriangulation.is_ghost_triangle((j, k, l))
       l, k, _ = DelaunayTriangulation.sort_triangle((j, k, l))
       j = DelaunayTriangulation.get_adjacent(mesh, k, l)
     end
+    # If the previous attempt failed, try switching orientation
     if DelaunayTriangulation.is_ghost_triangle((j, k, l))
       j = DelaunayTriangulation.get_adjacent(mesh, l, k)
     end
   end
-  if attempts == MAX_ATTEMPTS
-    @show j, k, l
+
+  if DelaunayTriangulation.is_ghost_triangle((j, k, l))
+    error("Failed to find triangle containing s = $(s); got ($j, $k, $l).")
   end
   j, k, l = sort((j, k, l))
   p, q, r = points[j], points[k], points[l]
