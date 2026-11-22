@@ -6,6 +6,7 @@ Benchmarks for 2019 HMDA data; CONUS only.
 
 Main functions:
 
+- `initialize()`: Initialize by pre-processing data, creating boundary files, and constructing benchmark meshes.
 - `plot_meshes()`: Plot meshes used in the benchmarks.
 - `get_meshes()`: Retrieve meshes used in the benchmarks.
 - `run_yu2025()`: Run benchmarks. Uses model due to Yu, Wang, and Wang (2025).
@@ -74,6 +75,8 @@ const ARROW_FILENAME = joinpath("data", "hmda2019.arrow")
 const SHAPEFILE = joinpath("data", "cb_2019_us_tract_500k.zip")
 const VSIZIP_SHAPEFILE = joinpath("/vsizip", "data", "cb_2019_us_tract_500k.zip", "cb_2019_us_tract_500k.shp")
 const ARROW_CLEANED = joinpath("data", "hmda2019_clean.arrow")
+
+const BOUNDARY_TOLERANCES = (0.5, 0.1, 0.01)
 
 function empty_factor(::Type{T}, levels::Vector{T}; ordered = false) where T
   return CategoricalVector{T}(undef, 0; levels = levels, ordered = ordered)
@@ -146,22 +149,22 @@ function hmda2019_clean()
     1   => "Conventional", # baseline
     2   => "FHA",
     3:4 => "VA-USDA"
-  ) |> CategoricalVector
+  ) |> x -> CategoricalVector(x; levels = ["Conventional", "FHA", "VA-USDA"])
 
   # APPLICANT INFO
   hmda.Ethnicity = CategoricalArrays.recode(tmp.derived_ethnicity,
     "Hispanic or Latino"      => "HL",
-    "Not Hispanic or Latino"  => "NHL" # baseline
-  ) |> CategoricalVector
+    "Not Hispanic or Latino"  => "NHL", # baseline
+  ) |> x -> CategoricalVector(x; levels = ["NHL", "HL"])
   hmda.Race = CategoricalArrays.recode(tmp.derived_race,
     "White"                     => "White", # baseline
     "Asian"                     => "Asian",
     "Black or African American" => "AA",
-  ) |> CategoricalVector
+  ) |> x -> CategoricalVector(x; levels = ["White", "Asian", "AA"])
   hmda.Sex = CategoricalArrays.recode(tmp.derived_sex,
     "Male"    => "Male", # baseline
     "Female"  => "Female",  
-  ) |> CategoricalVector
+  ) |> x -> CategoricalVector(x; levels = ["Male", "Female"])
   hmda.Age = CategoricalArrays.recode(tmp.applicant_age,
     "<25"   => "<25", # baseline
     "25-34" => "25-34",
@@ -170,7 +173,7 @@ function hmda2019_clean()
     "55-64" => "55-64",
     "65-74" => ">64",
     ">74"   => ">64",
-  ) |> CategoricalVector
+  ) |> x -> CategoricalVector(x; levels = ["<25", "25-34", "35-44", "45-54", "55-64", ">64"])
   hmda.Income = parse.(Int, tmp.income)
   hmda.DTI = parse.(Int, tmp.debt_to_income_ratio)
 
@@ -226,9 +229,10 @@ end
 function save_boundary_csv(out::Polygon, label)
   # Save a plot to check!
   fig = CairoMakie.plot(out)
-  CairoMakie.save("USBoundary_$(label).pdf", fig)
+  filename = joinpath("data", "USBoundary_$(label)")
+  CairoMakie.save(filename * ".pdf", fig)
   coords = LibGEOS.boundary(out) |> LibGEOS.getCoordSeq |> LibGEOS.getCoordinates
-  open("USBoundary_$(label).csv", "w") do io
+  open(filename * ".csv", "w") do io
     CSV.write(io, [], writeheader = true, header = ["x", "y"])
     for (x, y) in coords
       CSV.write(io, (; x = [x], y = [y]), append = true)
@@ -236,47 +240,97 @@ function save_boundary_csv(out::Polygon, label)
   end
 end
 
-function load_conus_triangulation(filepath)
+function load_conus_triangulation(filepath; kwargs...)
   boundary_points = [(row[1], row[2]) for row in eachrow(CSV.read(filepath, DataFrame))]
   boundary_unique = unique(boundary_points)
   lookup = Dict(key => i for (i, key) in enumerate(boundary_unique))
   curve = map(key -> lookup[key], boundary_points)
-  # init_mesh = triangulate(boundary_unique, boundary_nodes = reverse(curve))
   mesh = AdaptiveRefinement.build_mesh(;
     data = boundary_unique,
     boundary_nodes = reverse(curve),
-    inner = (; min_angle = 30.0, min_area = 0.2)
+    inner = (; kwargs...)
   )
   
   return mesh
 end
 
+function initialize()
+  global ARROW_FILENAME, ARROW_CLEANED, BOUNDARY_TOLERANCES
+  
+  # Make sure the clean HMDA data is available in Arrow format.
+  @info "Verifying we can load HMDA data"
+  !ispath(ARROW_FILENAME) && @time "Missing Arrow file; this will take a while..." hmda2019_csv2arrow()
+  !ispath(ARROW_CLEANED) && @time "Preprocessing data; this will take a while..." hmda2019_clean()
+  @time "Loading clean Arrow file" load_data()
+
+  # Make sure the US Boundary files are available
+  @info "Verifying each US boundary file is available"
+  for tol in BOUNDARY_TOLERANCES
+    @time "tol=$(tol)" begin
+      csv_bdd = joinpath("data", "USBoundary_tol=$(tol).csv")
+      if !ispath(csv_bdd)
+        bdd = extract_shapefile_boundary(; tol)
+        save_boundary_csv(bdd, "tol=$(tol)")
+      end
+    end
+  end
+
+  # Make sure the meshes are saved so we don't have to rebuild each time
+  @info "Building meshes"
+  tol_prev = first(BOUNDARY_TOLERANCES)
+  min_prev = 1.0
+  for tol in BOUNDARY_TOLERANCES
+    min_area = min_prev * 2 ^ (-ceil(log2(tol_prev / tol)))
+    min_prev = min_area
+    tol_prev = tol
+    @time "tol=$(tol)" begin
+      csv_bdd = joinpath("data", "USBoundary_tol=$(tol).csv")
+      jld2_mesh = joinpath("data", "hmda-mesh_tol=$(tol).jld2")
+      if !ispath(jld2_mesh)
+        mesh = load_conus_triangulation(csv_bdd;
+          max_edge = 1.0,
+          min_angle = 30.0,
+          min_area = min_area,
+        )
+        JLD2.save(jld2_mesh,
+          "mesh", mesh,
+          "tol", tol,
+          "max_edge", 1.0,
+          "min_angle", 30.0,
+          "min_area", min_area,
+          "offset", 0.0,
+          "cutoff", 1e-12,
+        )
+      end
+    end
+  end
+end
+
 function get_meshes()
-  return (
-    # load_conus_triangulation(joinpath("USBoundary_tol=0.5.csv")),
-    load_conus_triangulation(joinpath("USBoundary_tol=0.1.csv")),
-    # load_conus_triangulation(joinpath("USBoundary_tol=0.01.csv"))
-  )
+  global BOUNDARY_TOLERANCES
+  return [
+    JLD2.load(joinpath("data", "hmda-mesh_tol=$(tol).jld2"))["mesh"] for tol in BOUNDARY_TOLERANCES
+  ]
 end
 
 function plot_meshes()
-  Δs = get_meshes()
-  figtri = Figure(size = (400*length(Δs), 400));
-  for (j, Δ) in enumerate(Δs)
-    ax = Axis(figtri[1,j], title = get_tri_title(Δ))
-    triplot!(ax, Δ)
+  meshes = get_meshes()
+  figtri = Figure(size = (400*length(meshes), 400));
+  for (j, mesh) in enumerate(meshes)
+    ax = Axis(figtri[1,j], title = get_tri_title(mesh))
+    triplot!(ax, mesh)
   end
   figtri
   save(joinpath("figures", "HMDA-Meshes.pdf"), figtri)
   return nothing
 end
 
-function is_inside_mesh(Δ::Triangulation, s)
-  triangle = find_triangle(Δ, s, concavity_protection = true)
+function is_inside_mesh(mesh::Triangulation, s)
+  triangle = find_triangle(mesh, s, concavity_protection = true)
  return all(>(0), triangle)
 end
 
-is_inside_mesh(Δ::Triangulation) = Base.Fix1(is_inside_mesh, Δ)
+is_inside_mesh(mesh::Triangulation) = Base.Fix1(is_inside_mesh, mesh)
 
 function formula_yu2025()
   return @formula(0 ~
@@ -290,7 +344,8 @@ end
 function get_modelmatrix(tbl)
   formula = formula_yu2025()
   mf = ModelFrame(formula, tbl)
-  return ModelMatrix(mf)
+  mm = ModelMatrix(mf)
+  return mf, mm
 end
 
 function load_data()
@@ -308,26 +363,25 @@ function get_subsample(tbl_full, sample_pct)
   return tbl_full[mask, :]
 end
 
-function run_benchmark(rho, penalty; seed = 1903, sample_pct = 0.1)
+function run_benchmark(penalty, opts; seed = 1903, sample_pct = 0.1)
   Random.seed!(seed)
   penalty_names = Dict(
     L2Squared => "Ridge",
     L1Approx => "L1Smooth",
   )
   penalty_name = penalty_names[typeof(penalty)]
-  tol = 1e-5
 
   # Load triangulations
-  Δs = get_meshes()
+  meshes = HMDA.get_meshes()
 
   # Load data and drop cases with dubious values
-  tbl_full = load_data()
+  tbl_full = HMDA.load_data()
   
   # Sample the data to get down to a more manageable size
-  tbl = get_subsample(tbl_full, sample_pct)
+  tbl = HMDA.get_subsample(tbl_full, sample_pct)
 
   # Build model from DataFrame. Categorical variables saved as CategoricalVector.
-  mm = get_modelmatrix(tbl)
+  mf, mm = HMDA.get_modelmatrix(tbl)
 
   # Build response, model matrix, and spatial matrix
   X_sample = mm.m
@@ -335,46 +389,46 @@ function run_benchmark(rho, penalty; seed = 1903, sample_pct = 0.1)
   y_sample = Float64.(tbl.Denial)
 
   results = NamedTuple[]
-  for Δ in Δs
+  for mesh in meshes
     # Make sure locations lie in this version of the mesh!
-    idx = map(is_inside_mesh(Δ), eachcol(S_sample))
+    idx = map(HMDA.is_inside_mesh(mesh), eachcol(S_sample))
     y, X, S = y_sample[idx], X_sample[idx, :], S_sample[:, idx]
 
     # Run the benchmark
-    @timed SpatialRegression.fitmodel(VertexGLM, y, X, S, Δ;
+    @timed SpatialRegression.fitmodel(VertexGLM, y, X, S, mesh;
       family = Binomial(),
       link = LogitLink(),
-      rho = rho,
-      tol = tol,
-      backtrack = 100,
-      maxiter = 10,
       penalty = penalty,
-      nchunks = Threads.nthreads()
+      maxiter = 10,
+      rho = opts.rho,
+      tol = opts.tol,
+      backtrack = opts.backtrack,
+      nchunks = opts.nchunks,
     )
 
-    timed_result = @timed SpatialRegression.fitmodel(VertexGLM, y, X, S, Δ;
+    timed_result = @timed SpatialRegression.fitmodel(VertexGLM, y, X, S, mesh;
       family = Binomial(),
       link = LogitLink(),
-      rho = rho,
-      tol = tol,
-      backtrack = 100,
-      maxiter = 10^3,
       penalty = penalty,
-      nchunks = Threads.nthreads()
+      maxiter = opts.maxiter,
+      rho = opts.rho,
+      tol = opts.tol,
+      backtrack = opts.backtrack,
+      nchunks = opts.nchunks,
     )
 
     # Make predictions and check how we did.
     n, p = sum(idx), size(X, 2) - 1
     niter, m, logl = timed_result.value
     timing = timed_result.time
-    yhat = SpatialRegression.predict(X, S, m.vertex, Δ)
+    yhat = SpatialRegression.predict(X, S, m, mesh)
     rmse_resp = sqrt(mean(abs2, y - yhat))
     result = (;
       cases = n,
       features = p,
       response = y,
       location = S,
-      triangulation = Δ,
+      triangulation = mesh,
       prediction = yhat,
       niter, logl, timing, rmse_resp,
       penalty = penalty_name,
@@ -389,8 +443,8 @@ end
 #
 # TRIANGULATIONS
 #
-function get_tri_title(Δ)
-  stats = statistics(Δ)
+function get_tri_title(mesh)
+  stats = statistics(mesh)
   return "$(stats.num_solid_triangles) triangles, $(stats.num_solid_vertices) vertices"
 end
 
@@ -405,18 +459,18 @@ function plot_fitted(instances; markersize = 4.0, kwargs...)
   cr = Observable((0.0, 1.0))
   for (j, prob) in enumerate(instances)
     # Retrieve information about the instance
-    y, yhat, Δ, S = prob.response, prob.prediction, prob.triangulation, prob.location
+    y, yhat, mesh, S = prob.response, prob.prediction, prob.triangulation, prob.location
 
     # Retrive the boundary
-    nodes = DelaunayTriangulation.get_boundary_nodes(Δ)
-    pts = DelaunayTriangulation.get_points(Δ)
+    nodes = DelaunayTriangulation.get_boundary_nodes(mesh)
+    pts = DelaunayTriangulation.get_points(mesh)
     path = pts[nodes]
 
     # Update minimum and maximum values for color scale
     cr[] = (min(minimum(y), minimum(yhat)), max(maximum(y), maximum(yhat)))
 
     # Add a row label with triangulation characteristics
-    Label(fig[1,1+j], get_tri_title(Δ), font = :bold, tellwidth = false)
+    Label(fig[1,1+j], get_tri_title(mesh), font = :bold, tellwidth = false)
 
     # Add a panel for observed data
     ax = Axis(fig[2,1+j])
@@ -437,12 +491,18 @@ function run_yu2025()
     L2Squared => "Ridge",
     L1Approx => "L1Smooth",
   )
-  rho = 1e-1
+  opts = (;
+      maxiter = 1000,
+      rho = 1.0,
+      tol = 1e-3,
+      backtrack = 10,
+      nchunks = 4,
+  )
   for pct in (1, 5, 25, 50), penalty in (L2Squared(), L1Approx(sqrt(1e-10)))
-    results = run_benchmark(rho, penalty; sample_pct = pct/100, seed = 1903)
+    results = run_benchmark(penalty, opts; sample_pct = pct/100, seed = 1903)
     penalty_name = penalty_names[typeof(penalty)]
     plot_fitted(results; markersize = 4)
-    save(joinpath("figures", "HMDA-n=$(pct)pct-$(penalty_name).pdf"), current_figure())
+    save(joinpath("figures", "HMDA_n=$(pct)pct_$(penalty_name).pdf"), current_figure())
     display(current_figure())
 
     tbl = DataFrame()
@@ -464,17 +524,18 @@ function run_yu2025()
       )
     end
 
-    open(joinpath("tables", "HMDA-n=$(pct)pct-$(penalty_name).txt"), "w") do io
+    open(joinpath("tables", "HMDA_n=$(pct)pct_$(penalty_name).txt"), "w") do io
       pretty_table(io, tbl; backend = :latex)
     end
     display(tbl)
 
     JLD2.save(
-      joinpath("models", "HMDA-n=$(pct)pct-$(penalty_name).jld2"),
+      joinpath("models", "HMDA_n=$(pct)pct_$(penalty_name).jld2"),
       Dict(
         "$(k)" => r.vertex for (k, r) in enumerate(results)
       )
     )
   end
 end
+
 end # module
